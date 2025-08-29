@@ -1,0 +1,7 @@
+__pycache__/
+.mypy_cache/
+.vscode/
+.devcontainer/
+.env
+stock_prediction_charts/
+*.bak

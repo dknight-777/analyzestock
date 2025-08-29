@@ -1,0 +1,33 @@
+services:
+  python:
+    build: .
+    container_name: python-app
+    depends_on:
+      - postgresql
+    volumes:
+      - ./:/app/src
+    env_file:
+      - .env
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]      
+  postgresql:
+    image: postgres:16
+    container_name: postgres-db
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - stock_info_postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    shm_size: "4gb"
+    command: postgres -c listen_addresses='*'
+
+volumes:
+  stock_info_postgres_data:
+    external: true
