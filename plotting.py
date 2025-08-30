@@ -36,65 +36,62 @@ def plot_prediction_chart(
     start_date = last_date - pd.DateOffset(days=plot_range_days)
     plot_df = df[df["record_date"] >= start_date].copy()
 
-    plt.plot(plot_df["record_date"], plot_df["close"], label="実際の株価", color="blue")
-    plt.plot(
-        future_dates,
-        predictions,
-        label=f"将来の予測 ({model_type.upper()})",
-        linestyle="--",
-        color="orange",
-    )
+    # Combine all dates for x-axis labeling
+    all_dates = pd.concat([plot_df["record_date"], pd.Series(future_dates)]).sort_values().reset_index(drop=True)
 
-    # バックテストのプロット
-    if backtest_data:
-        plt.plot(
-            backtest_data["dates"],
-            backtest_data["predictions"],
-            label="バックテスト予測",
-            linestyle=":",
-            color="green",
-        )
+    # Plot actual stock price using numerical index
+    plt.plot(range(len(plot_df)), plot_df["close"], label="実際の株価", color="blue")
+
+    # Plot future predictions using numerical index, offset by length of actual data
+    # Prepend the last actual close value to predictions to create a continuous line
+    # The x-coordinate for this point will be len(plot_df) - 1
+    extended_predictions = np.insert(predictions, 0, plot_df["close"].iloc[-1])
+
+    # The x-range for the extended predictions starts from the last actual data point's index
+    start_index_extended_predictions = len(plot_df) - 1
+    
+    plt.plot(range(start_index_extended_predictions, start_index_extended_predictions + len(extended_predictions)),
+             extended_predictions,
+             label=f"将来の予測 ({model_type.upper()})",
+             linestyle="--", # Keep the same linestyle as future predictions
+             color="orange")
+
+    # 予測接続線は将来予測に含められたため削除
+
+    # Set x-axis ticks and labels to show actual dates
+    tick_indices = np.linspace(0, len(all_dates) - 1, 10, dtype=int)
+    tick_labels = [all_dates.iloc[i].strftime("%Y-%m-%d") for i in tick_indices]
+    plt.xticks(tick_indices, tick_labels, rotation=45, ha="right")
 
     # 最高値・最安値の注釈
-    plot_data_frames = [(plot_df, "blue")]
-    if predictions.size > 0:
-        plot_data_frames.append(
-            (
-                pd.DataFrame(
-                    {"record_date": future_dates, "close": predictions.flatten()}
-                ),
-                "orange",
-            )
-        )
-    if backtest_data and backtest_data["predictions"].size > 0:
-        plot_data_frames.append(
-            (
-                pd.DataFrame(
-                    {
-                        "record_date": backtest_data["dates"],
-                        "close": backtest_data["predictions"].flatten(),
-                    }
-                ),
-                "green",
-            )
-        )
+    # Create a list of DataFrames, each with 'numerical_index', 'record_date', 'close'
+    annotation_dfs = []
 
-    for data, color in plot_data_frames:
-        if not data.empty:
-            for func, va in [
-                (data["close"].idxmax, "bottom"),
-                (data["close"].idxmin, "top"),
-            ]:
-                idx = func()
-                row = data.loc[idx]
+    # Actual data
+    actual_annotation_df = plot_df[["record_date", "close"]].copy()
+    actual_annotation_df["numerical_index"] = range(len(plot_df))
+    annotation_dfs.append((actual_annotation_df, "blue"))
+
+    # Predicted data
+    if predictions.size > 0:
+        predicted_annotation_df = pd.DataFrame({
+            "record_date": future_dates,
+            "close": predictions.flatten()
+        })
+        predicted_annotation_df["numerical_index"] = range(len(plot_df), len(plot_df) + len(predictions))
+        annotation_dfs.append((predicted_annotation_df, "orange"))
+
+    for data_frame, color in annotation_dfs:
+        if not data_frame.empty:
+            for index, row in data_frame.iterrows():
                 plt.text(
-                    row["record_date"],
+                    row["numerical_index"], # Use numerical index for x-coordinate
                     row["close"],
                     f" {row['close']:.2f}",
-                    va=va,
-                    ha="left",
+                    va="center", # Center vertically
+                    ha="center", # Center horizontally
                     color=color,
-                    fontsize=9,
+                    fontsize=7, # Smaller font size to reduce clutter
                 )
 
     time_frame_japanese = "日足" if time_frame == "daily" else "週足"
@@ -107,9 +104,7 @@ def plot_prediction_chart(
     plt.legend()
     plt.grid(True, linestyle="--", alpha=0.6)
     plt.tight_layout()
-    plt.gca().xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter("%Y-%m-%d"))
-    plt.gca().xaxis.set_major_locator(plt.matplotlib.dates.DayLocator(interval=7))
-    plt.gcf().autofmt_xdate()
+    # 旧X軸フォーマット設定 (ユーザーの要望により削除)
 
     output_dir = Path("stock_prediction_charts")
     output_dir.mkdir(exist_ok=True)
