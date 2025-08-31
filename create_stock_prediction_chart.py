@@ -2,6 +2,8 @@ import os
 import random
 import sys
 import argparse
+import uuid
+
 import numpy as np
 import pandas as pd
 import torch
@@ -10,7 +12,14 @@ from torch.utils.data import TensorDataset, DataLoader
 
 # Import refactored modules
 from data_processing import create_sequences
-from db_utils import get_db_engine, get_stock_data
+from db_utils import (
+    get_db_engine,
+    get_stock_data,
+    save_prediction_run,
+    save_prediction_chart,
+    save_stock_predictions,
+    save_run_evaluations,
+)
 from models import get_model
 from plotting import plot_prediction_chart
 from training import train_model, predict_future_values
@@ -25,14 +34,14 @@ random.seed(42)
 
 def main():
     # 引数を解析
-    parser = argparse.ArgumentParser(description="株価予測チャートを作成します。")
+    parser = argparse.ArgumentParser(description="株価予測チャートを作成します。 সন")
     parser.add_argument("--stock_code", type=str, default="9432", help="証券コード")
     parser.add_argument(
         "--model_type",
         type=str,
         choices=["lstm", "nn", "gru", "transformer"],
         default=None,
-        help="モデルの種類 (lstm, nn, gru, transformer)。指定しない場合は全てのモデルが実行されます。",
+        help="モデルの種類 (lstm, nn, gru, transformer)。指定しない場合は全てのモデルが実行されます。 সন",
     )
     parser.add_argument(
         "--time_frame",
@@ -48,26 +57,32 @@ def main():
         "--device",
         type=str,
         choices=["cpu", "cuda"],
+        default=None, # デフォルトはNoneにして後で設定
         help="使用するデバイス (cpu or cuda)",
     )
     args = parser.parse_args()
 
-    # デバイスの確認
-    device_str = (
-        args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
-    device = torch.device(device_str)
+    # --- 0. 準備 ---
+    # デバイスの確認と設定
+    if args.device is None:
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(args.device)
     print(f"Using device: {device}")
 
-    # 株価データを取得
+    # データベースエンジン取得
     engine = get_db_engine()
     if not engine:
         sys.exit(1)
 
+    # この実行を識別するためのユニークなバッチIDを生成
+    prediction_batch_id = uuid.uuid4()
+    print(f"Prediction Batch ID: {prediction_batch_id}")
+
+    # 株価データを取得
     df = get_stock_data(engine, args.stock_code)
 
     if df.empty:
-        print(f"銘柄コード {args.stock_code} のデータが見つかりませんでした。")
+        print(f"銘柄コード {args.stock_code} のデータが見つかりませんでした。 সন")
         sys.exit(1)
 
     stock_name = (
@@ -150,63 +165,109 @@ def main():
     )
 
     evaluation_results = []
+    updated_by_script = os.path.basename(__file__)
 
-    for model_type in models_to_run:
-        print(f"\n--- Running prediction for model: {model_type} ---\
-")
+    # --- 5. DB保存処理（トランザクション管理） ---
+    try:
+        with engine.connect() as connection:
+            # トランザクションを開始
+            with connection.begin() as transaction:
+                print("\n--- データベースへの保存処理を開始します（トランザクション開始） ---")
+                try:
+                    # 最初に実行時引数を保存
+                    save_prediction_run(connection, prediction_batch_id, args, updated_by_script)
 
-        model = get_model(
-            model_type=model_type,
-            input_dim=len(feature_columns),
-            seq_length=args.seq_length
-        ).to(device)
+                    for model_type in models_to_run:
+                        print(f"\n--- Running prediction for model: {model_type} ---")
 
-        model = train_model(model, train_loader, args.epochs, device)
+                        model = get_model(
+                            model_type=model_type,
+                            input_dim=len(feature_columns),
+                            seq_length=args.seq_length
+                        ).to(device)
 
-        backtest_predictions, metrics = evaluate_model(
-            model, test_loader, scaler, device, len(feature_columns)
-        )
-        metrics["model"] = model_type
-        evaluation_results.append(metrics)
+                        model = train_model(model, train_loader, args.epochs, device)
 
-        predictions = predict_future_values(
-            model,
-            features_scaled,
-            future_dates,
-            scaler,
-            args.seq_length,
-            device,
-            feature_columns,
-        )
+                        backtest_predictions, metrics = evaluate_model(
+                            model, test_loader, scaler, device, len(feature_columns)
+                        )
+                        metrics["model"] = model_type
+                        evaluation_results.append(metrics)
 
-        plot_prediction_chart(
-            df,
-            predictions,
-            future_dates,
-            args.stock_code,
-            stock_name,
-            model_type,
-            args.time_frame,
-            backtest_data={
-                "dates": df["record_date"].tail(test_period),
-                "predictions": backtest_predictions,
-            },
-        )
+                        predictions = predict_future_values(
+                            model,
+                            features_scaled,
+                            future_dates,
+                            scaler,
+                            args.seq_length,
+                            device,
+                            feature_columns,
+                        )
 
-    # --- 5. 最終評価結果 ---
-    if len(evaluation_results) > 1:
+                        chart_binary = plot_prediction_chart(
+                            df,
+                            predictions,
+                            future_dates,
+                            args.stock_code,
+                            stock_name,
+                            model_type,
+                            args.time_frame,
+                            backtest_data={
+                                "dates": df["record_date"].tail(test_period),
+                                "predictions": backtest_predictions,
+                            },
+                        )
+                        print(f"グラフをメモリ上に生成しました。 সন")
+
+                        # データベースに保存
+                        chart_id = save_prediction_chart(
+                            connection, prediction_batch_id, model_type, chart_binary, updated_by_script
+                        )
+
+                        if chart_id:
+                            predictions_df = pd.DataFrame(
+                                {"date": future_dates, "prediction": predictions.flatten()}
+                            )
+                            save_stock_predictions(
+                                connection,
+                                prediction_batch_id,
+                                chart_id,
+                                model_type,
+                                args.stock_code,
+                                predictions_df,
+                                updated_by_script,
+                            )
+                    
+                    # 全モデルの評価結果を保存
+                    if evaluation_results:
+                        save_run_evaluations(connection, prediction_batch_id, evaluation_results, updated_by_script)
+                    
+                    # with connection.begin() を使っているため、正常終了すれば自動でコミットされる
+                    print("\n--- データベースへの保存処理が正常に完了しました（トランザクションコミット） ---")
+
+                except Exception as e:
+                    print(f"\n--- トランザクション内でエラーが発生しました。処理をロールバックします。 ---")
+                    print(f"エラー詳細: {e}")
+                    transaction.rollback() # withブロックが終了する際に自動でロールバックされるが、念のため明示
+                    raise # エラーを再送出
+
+    except Exception as e:
+        print(f"\n--- データベース接続またはトランザクション開始に失敗しました。 ---")
+        print(f"エラー詳細: {e}")
+
+    # --- 6. 最終評価結果の表示 ---
+    if evaluation_results and len(evaluation_results) > 1:
         results_df = pd.DataFrame(evaluation_results).set_index("model")
         print("\n--- 全モデルの最終評価結果 ---")
         print(results_df.round(4))
         print("\n--- 評価指標の見方 ---")
-        print("RMSE (二乗平均平方根誤差): 値が小さいほど良いです。")
-        print("MAE (平均絶対誤差): 値が小さいほど良いです。")
-        print("R2スコア (決定係数): 値が1に近いほど良いです。")
+        print("RMSE (二乗平均平方根誤差): 値が小さいほど良いです。 সন")
+        print("MAE (平均絶対誤差): 値が小さいほど良いです。 সন")
+        print("R2スコア (決定係数): 値が1に近いほど良いです。 সন")
         print("----------------------")
         best_model = results_df["R2 Score"].idxmax()
         print(f"\n最も優れたモデル (R2スコア基準): {best_model}")
         print("---------------------------------")
-
 
 if __name__ == "__main__":
     main()
