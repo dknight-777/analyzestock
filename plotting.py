@@ -1,3 +1,4 @@
+import io
 from datetime import datetime
 from pathlib import Path
 
@@ -16,8 +17,8 @@ def plot_prediction_chart(
     model_type: str,
     time_frame: str,
     backtest_data: dict | None = None,
-):
-    """結果をプロットし、チャートをファイルに保存します。"""
+) -> bytes:
+    """結果をプロットし、チャート画像のバイナリデータを返します。"""
     try:
         font_path = "/usr/share/fonts/truetype/takao-gothic/TakaoPGothic.ttf"
         font_prop = fm.FontProperties(fname=font_path)
@@ -106,11 +107,9 @@ def plot_prediction_chart(
     plt.tight_layout()
     # 旧X軸フォーマット設定 (ユーザーの要望により削除)
 
-    output_dir = Path("stock_prediction_charts")
-    output_dir.mkdir(exist_ok=True)
-    now = datetime.now().strftime("%Y%m%d_%H%M%S")
-    chart_filename = (
-        output_dir / f"{stock_code}_prediction_{model_type}_{time_frame}_{now}.png"
-    )
-    plt.savefig(chart_filename, dpi=150)
-    print(f"グラフを {chart_filename} として保存しました。")
+    # ファイルに保存する代わりに、バイナリデータを返す
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=150)
+    plt.close()  # メモリリークを防ぐために図を閉じる
+    buf.seek(0)
+    return buf.getvalue()
