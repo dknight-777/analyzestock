@@ -16,9 +16,15 @@ RUN apt-get update && \
         wget \
         unzip \
         openssh-client \
+        lsb-release \
         iputils-ping \
         fonts-takao-gothic fonts-takao-mincho fonts-takao-pgothic \
         build-essential python3-dev libffi-dev libssl-dev && \
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null && \
+    # ここにapt-get updateを追加
+    apt-get update && \
+    apt-get install -y --no-install-recommends docker-ce-cli && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # 作業ディレクトリを設定
