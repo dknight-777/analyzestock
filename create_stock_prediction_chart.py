@@ -34,14 +34,14 @@ random.seed(42)
 
 def main():
     # 引数を解析
-    parser = argparse.ArgumentParser(description="株価予測チャートを作成します。 সন")
+    parser = argparse.ArgumentParser(description="株価予測チャートを作成します。")
     parser.add_argument("--stock_code", type=str, default="9432", help="証券コード")
     parser.add_argument(
         "--model_type",
         type=str,
-        choices=["lstm", "nn", "gru", "transformer"],
+        choices=["lstm", "nn", "gru"],
         default=None,
-        help="モデルの種類 (lstm, nn, gru, transformer)。指定しない場合は全てのモデルが実行されます。 সন",
+        help="モデルの種類 (lstm, nn, gru)。指定しない場合は全てのモデルが実行されます。",
     )
     parser.add_argument(
         "--time_frame",
@@ -63,26 +63,21 @@ def main():
     args = parser.parse_args()
 
     # --- 0. 準備 ---
-    # デバイスの確認と設定
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(args.device)
     print(f"Using device: {device}")
 
-    # データベースエンジン取得
     engine = get_db_engine()
     if not engine:
         sys.exit(1)
 
-    # この実行を識別するためのユニークなバッチIDを生成
     prediction_batch_id = uuid.uuid4()
     print(f"Prediction Batch ID: {prediction_batch_id}")
 
-    # 株価データを取得
     df = get_stock_data(engine, args.stock_code)
-
     if df.empty:
-        print(f"銘柄コード {args.stock_code} のデータが見つかりませんでした。 সন")
+        print(f"銘柄コード {args.stock_code} のデータが見つかりませんでした。")
         sys.exit(1)
 
     stock_name = (
@@ -99,7 +94,7 @@ def main():
     else:
         df = df.resample("W").last()
     df.reset_index(inplace=True)
-    df.dropna(subset=["close"], inplace=True)
+    df.dropna(subset=["close", "volume"], inplace=True)
 
     df["day_of_week"] = df["record_date"].dt.dayofweek
     df["day_of_month"] = df["record_date"].dt.day
@@ -120,7 +115,7 @@ def main():
 
     # --- 2. 特徴量とスケーリング ---
     feature_columns = [
-        "close",
+        "close", "volume",
         "day_of_week_sin", "day_of_week_cos",
         "day_of_month_sin", "day_of_month_cos",
         "month_sin", "month_cos",
@@ -129,35 +124,16 @@ def main():
         "year"
     ]
     features = df[feature_columns].copy()
-
+    
+    # 全特徴量のスケーラー
     scaler = MinMaxScaler()
     features_scaled = scaler.fit_transform(features)
 
-    # --- 3. シーケンス作成とデータ分割 ---
-    X, y = create_sequences(features_scaled, args.seq_length)
-
-    # バックテスト用にデータを分割 (最後のN日間をテストデータとする)
-    test_period = args.fut_pred
-    X_train, y_train = X[:-test_period], y[:-test_period]
-    X_test, y_test = X[-test_period:], y[-test_period:]
-
-    X_train_tensor = torch.from_numpy(X_train).float()
-    y_train_tensor = torch.from_numpy(y_train).float()
-    X_test_tensor = torch.from_numpy(X_test).float()
-    y_test_tensor = torch.from_numpy(y_test).float()
-
-    train_data = TensorDataset(X_train_tensor, y_train_tensor)
-    test_data = TensorDataset(X_test_tensor, y_test_tensor)
-
-    batch_size = 32
-    train_loader = DataLoader(train_data, shuffle=False, batch_size=batch_size, drop_last=True)
-    test_loader = DataLoader(test_data, shuffle=False, batch_size=batch_size)
-
-    # --- 4. モデル学習・評価・予測ループ ---
+    # --- モデル学習・評価・予測ループ ---
     models_to_run = (
         [args.model_type]
         if args.model_type
-        else ["lstm", "nn", "gru", "transformer"]
+        else ["lstm", "nn", "gru"]
     )
     
     future_dates = pd.bdate_range(
@@ -167,19 +143,36 @@ def main():
     evaluation_results = []
     updated_by_script = os.path.basename(__file__)
 
-    # --- 5. DB保存処理（トランザクション管理） ---
     try:
         with engine.connect() as connection:
-            # トランザクションを開始
             with connection.begin() as transaction:
                 print("\n--- データベースへの保存処理を開始します（トランザクション開始） ---")
                 try:
-                    # 最初に実行時引数を保存
                     save_prediction_run(connection, prediction_batch_id, args, updated_by_script)
 
                     for model_type in models_to_run:
                         print(f"\n--- Running prediction for model: {model_type} ---")
 
+                        # --- 3. シーケンス作成とデータ分割 ---
+                        X, y = create_sequences(features_scaled, args.seq_length)
+
+                        test_period = args.fut_pred
+                        X_train, y_train = X[:-test_period], y[:-test_period]
+                        X_test, y_test = X[-test_period:], y[-test_period:]
+
+                        X_train_tensor = torch.from_numpy(X_train).float()
+                        y_train_tensor = torch.from_numpy(y_train).float()
+                        X_test_tensor = torch.from_numpy(X_test).float()
+                        y_test_tensor = torch.from_numpy(y_test).float()
+
+                        train_data = TensorDataset(X_train_tensor, y_train_tensor)
+                        test_data = TensorDataset(X_test_tensor, y_test_tensor)
+
+                        batch_size = 32
+                        train_loader = DataLoader(train_data, shuffle=False, batch_size=batch_size, drop_last=True)
+                        test_loader = DataLoader(test_data, shuffle=False, batch_size=batch_size)
+                        
+                        # --- 4. モデルの取得と学習 ---
                         model = get_model(
                             model_type=model_type,
                             input_dim=len(feature_columns),
@@ -188,6 +181,7 @@ def main():
 
                         model = train_model(model, train_loader, args.epochs, device)
 
+                        # --- 5. 評価と予測 ---
                         backtest_predictions, metrics = evaluate_model(
                             model, test_loader, scaler, device, len(feature_columns)
                         )
@@ -213,13 +207,12 @@ def main():
                             model_type,
                             args.time_frame,
                             backtest_data={
-                                "dates": df["record_date"].tail(test_period),
+                                "dates": df["record_date"].tail(len(backtest_predictions)),
                                 "predictions": backtest_predictions,
                             },
                         )
-                        print(f"グラフをメモリ上に生成しました。 সন")
+                        print(f"グラフをメモリ上に生成しました。")
 
-                        # データベースに保存
                         chart_id = save_prediction_chart(
                             connection, prediction_batch_id, model_type, chart_binary, updated_by_script
                         )
@@ -238,18 +231,16 @@ def main():
                                 updated_by_script,
                             )
                     
-                    # 全モデルの評価結果を保存
                     if evaluation_results:
                         save_run_evaluations(connection, prediction_batch_id, evaluation_results, updated_by_script)
                     
-                    # with connection.begin() を使っているため、正常終了すれば自動でコミットされる
                     print("\n--- データベースへの保存処理が正常に完了しました（トランザクションコミット） ---")
 
                 except Exception as e:
                     print(f"\n--- トランザクション内でエラーが発生しました。処理をロールバックします。 ---")
                     print(f"エラー詳細: {e}")
-                    transaction.rollback() # withブロックが終了する際に自動でロールバックされるが、念のため明示
-                    raise # エラーを再送出
+                    transaction.rollback()
+                    raise
 
     except Exception as e:
         print(f"\n--- データベース接続またはトランザクション開始に失敗しました。 ---")
@@ -261,9 +252,9 @@ def main():
         print("\n--- 全モデルの最終評価結果 ---")
         print(results_df.round(4))
         print("\n--- 評価指標の見方 ---")
-        print("RMSE (二乗平均平方根誤差): 値が小さいほど良いです。 সন")
-        print("MAE (平均絶対誤差): 値が小さいほど良いです。 সন")
-        print("R2スコア (決定係数): 値が1に近いほど良いです。 সন")
+        print("RMSE (二乗平均平方根誤差): 値が小さいほど良いです。")
+        print("MAE (平均絶対誤差): 値が小さいほど良いです。")
+        print("R2スコア (決定係数): 値が1に近いほど良いです。")
         print("----------------------")
         best_model = results_df["R2 Score"].idxmax()
         print(f"\n最も優れたモデル (R2スコア基準): {best_model}")

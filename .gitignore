@@ -5,3 +5,4 @@ __pycache__/
 .env
 stock_prediction_charts/
 *.bak
+reports/

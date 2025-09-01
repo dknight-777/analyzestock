@@ -77,6 +77,11 @@ def predict_future_values(
     test_inputs = data_normalized[-seq_length:].tolist()
     predictions_normalized = []
 
+    # volumeカラムのインデックスを取得
+    has_volume = "volume" in feature_columns
+    if has_volume:
+        volume_col_index = feature_columns.index("volume")
+
     for i in range(len(future_dates)):
         seq = torch.FloatTensor([test_inputs[-seq_length:]]).to(device)
 

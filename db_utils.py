@@ -67,6 +67,7 @@ def get_stock_data(engine: Engine, code: str) -> pd.DataFrame:
             SELECT
                 sv.record_date,
                 sv.close,
+                sv.volume,
                 s.stock_name
             FROM stock_values sv
             LEFT JOIN (

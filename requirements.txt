@@ -18,3 +18,4 @@ torchvision==0.20.1
 torchaudio==2.5.1
 pandas-stubs==2.3.0.250703
 types-pytz==2025.2.0.20250809
+reportlab
