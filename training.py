@@ -1,10 +1,13 @@
 import sys
 import numpy as np
+import pandas as pd
 import torch
 from sklearn.preprocessing import MinMaxScaler
 from torch import nn
 from torch.utils.data import DataLoader
-from pandas import DatetimeIndex, DataFrame, to_datetime
+from pandas import DatetimeIndex, DataFrame, to_datetime, date_range, DateOffset
+
+from data_processing import add_date_features, add_technical_features
 
 def train_model(
     model: nn.Module,
@@ -64,71 +67,86 @@ def train_model(
 
 def predict_future_values(
     model: nn.Module,
-    data_normalized: np.ndarray,
-    future_dates: DatetimeIndex,
+    historical_df: pd.DataFrame,
+    future_dates: pd.DatetimeIndex,
     scaler: MinMaxScaler,
     seq_length: int,
     device: torch.device,
     feature_columns: list,
-) -> np.ndarray:
-    """学習済みモデルを使用して将来の値を予測します。"""
+) -> tuple[np.ndarray, np.ndarray]:
+    """学習済みモデルを使用して将来の値を予測します。特徴量を動的に再計算します。"""
     model.eval()
 
-    test_inputs = data_normalized[-seq_length:].tolist()
-    predictions_normalized = []
+    # --- 特徴量のインデックスを取得 ---
+    close_col_idx = feature_columns.index("close")
+    volume_col_index = feature_columns.index("volume")
 
-    # volumeカラムのインデックスを取得
-    has_volume = "volume" in feature_columns
-    if has_volume:
-        volume_col_index = feature_columns.index("volume")
+    # --- 平均的なローソク足の形状を計算 ---
+    open_offset = (historical_df['open'] - historical_df['close']).mean()
+    high_offset = (historical_df['high'] - historical_df['close']).mean()
+    low_offset = (historical_df['low'] - historical_df['close']).mean()
 
-    for i in range(len(future_dates)):
-        seq = torch.FloatTensor([test_inputs[-seq_length:]]).to(device)
+    # 予測プロセス用のデータフレームを準備
+    predictions_df = historical_df.copy()
+
+    for date in future_dates:
+        # --- 1. 最後のシーケンスを取得してスケール変換 ---
+        # スケーラーにDataFrameを直接渡すように修正
+        last_sequence = predictions_df[feature_columns].tail(seq_length)
+        last_sequence_scaled = scaler.transform(last_sequence)
+        
+        seq = torch.from_numpy(last_sequence_scaled).float().unsqueeze(0).to(device)
 
         with torch.no_grad():
-            predicted_close_normalized = model(seq).item()
-            predictions_normalized.append(predicted_close_normalized)
+            # --- 2. 1期先を予測 ---
+            prediction_normalized = model(seq)[0].cpu().numpy()
 
-            if i < len(future_dates) - 1:
-                next_date = future_dates[i]
-                future_df = DataFrame([[next_date]], columns=["record_date"])
-                future_df["record_date"] = to_datetime(future_df["record_date"])
+            # --- ★★★ 安定化のためのクリッピング処理 ★★★ ---
+            prediction_normalized = np.clip(prediction_normalized, 0, 1)
 
-                future_df["day_of_week"] = future_df["record_date"].dt.dayofweek
-                future_df["day_of_month"] = future_df["record_date"].dt.day
-                future_df["month"] = future_df["record_date"].dt.month
-                future_df["year"] = future_df["record_date"].dt.year
-                future_df["day_of_year"] = future_df["record_date"].dt.dayofyear
-                future_df["week_of_year"] = (
-                    future_df["record_date"].dt.isocalendar().week.astype(int)
-                )
+            # --- 3. 予測値を逆変換して実際の値を取得 ---
+            dummy_array = np.zeros((1, len(feature_columns)))
+            dummy_array[0, close_col_idx] = prediction_normalized[0]
+            dummy_array[0, volume_col_index] = prediction_normalized[1]
+            inversed_pred = scaler.inverse_transform(dummy_array)
+            
+            predicted_close = inversed_pred[0, close_col_idx]
+            predicted_volume = inversed_pred[0, volume_col_index]
 
-                for col, max_val in [
-                    ("day_of_week", 7),
-                    ("day_of_month", 31),
-                    ("month", 12),
-                    ("day_of_year", 366),
-                    ("week_of_year", 53),
-                ]:
-                    future_df[f"{col}_sin"] = np.sin(
-                        2 * np.pi * future_df[col] / max_val
-                    )
-                    future_df[f"{col}_cos"] = np.cos(
-                        2 * np.pi * future_df[col] / max_val
-                    )
+            # --- 4. 新しい行を作成 ---
+            new_row_data = {
+                'record_date': date,
+                'close': predicted_close,
+                'volume': max(0, predicted_volume),
+                'open': predicted_close + open_offset,
+                'high': max(predicted_close, predicted_close + high_offset),
+                'low': min(predicted_close, predicted_close + low_offset),
+            }
+            new_row_df = pd.DataFrame([new_row_data])
+            
+            # --- 5. 特徴量を再計算してDataFrameに追加 ---
+            predictions_df = pd.concat([predictions_df, new_row_df], ignore_index=True)
+            
+            predictions_df = add_date_features(predictions_df)
+            predictions_df = add_technical_features(predictions_df)
+            
+            predictions_df[feature_columns] = predictions_df[feature_columns].ffill()
+            predictions_df[feature_columns] = predictions_df[feature_columns].bfill()
 
-                # Use a temporary DataFrame to handle column alignment for scaling
-                temp_df = DataFrame(0, index=[0], columns=feature_columns)
-                for col in future_df.columns:
-                    if col in temp_df.columns:
-                        temp_df[col] = future_df[col].values
+    # --- 6. 最終的な予測値を抽出 ---
+    future_predictions = predictions_df[predictions_df['record_date'].isin(future_dates)]
+    predicted_prices = future_predictions['close'].values
+    predicted_volumes = future_predictions['volume'].values
 
-                next_input_scaled = scaler.transform(temp_df)
-                next_input_scaled[0, 0] = predicted_close_normalized
-                test_inputs.append(next_input_scaled[0].tolist())
+    return np.maximum(0, predicted_prices), np.maximum(0, predicted_volumes)
 
-    dummy_array = np.zeros((len(predictions_normalized), len(feature_columns)))
-    dummy_array[:, 0] = predictions_normalized
-    predictions_rescaled = scaler.inverse_transform(dummy_array)[:, 0]
 
-    return predictions_rescaled
+def create_future_dates(
+    last_date_str: str,
+    periods: int,
+    freq: str = "B"
+) -> DatetimeIndex:
+    """指定された最終日から将来の営業日の日付インデックスを生成します。"""
+    last_date = to_datetime(last_date_str)
+    future_dates = date_range(start=last_date + DateOffset(days=1), periods=periods, freq=freq)
+    return future_dates

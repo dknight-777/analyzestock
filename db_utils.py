@@ -6,6 +6,7 @@ from datetime import datetime
 import argparse
 
 import pandas as pd
+import numpy as np
 from sqlalchemy import create_engine, text, Engine, Connection
 
 # データベース接続情報
@@ -66,6 +67,9 @@ def get_stock_data(engine: Engine, code: str) -> pd.DataFrame:
             """
             SELECT
                 sv.record_date,
+                sv.open,
+                sv.high,
+                sv.low,
                 sv.close,
                 sv.volume,
                 s.stock_name
@@ -121,6 +125,8 @@ def save_stock_predictions(
     updated_by: str,
 ):
     """株価の予測結果をまとめて保存します。"""
+    predictions_df["prediction"] = predictions_df["prediction"].astype(float)
+    predictions_df["volume"] = predictions_df["volume"].astype(int)
     records_to_insert = []
     for index, row in predictions_df.iterrows():
         records_to_insert.append(
@@ -128,9 +134,10 @@ def save_stock_predictions(
                 "prediction_batch_id": batch_id,
                 "chart_id": chart_id,
                 "model_name": model_name,
-                "prediction_target_date": row["date"],
+                "prediction_target_date": row["date"].date(),
                 "code": code,
-                "predicted_value": float(row["prediction"]) if row.get("prediction") is not None else None,
+                "predicted_value": float(row["prediction"].item()) if isinstance(row["prediction"], (np.ndarray, np.generic)) else (float(row["prediction"]) if row.get("prediction") is not None else None),
+                "predicted_volume": int(row["volume"].item()) if isinstance(row["volume"], (np.ndarray, np.generic)) else (int(row["volume"]) if row.get("volume") is not None else None),
                 "updated_by": updated_by,
                 "updated_at": datetime.now(),
             }
@@ -139,8 +146,8 @@ def save_stock_predictions(
     if records_to_insert:
         query = text(
             """
-            INSERT INTO stock_predictions (prediction_batch_id, chart_id, model_name, prediction_target_date, code, predicted_value, updated_by, updated_at)
-            VALUES (:prediction_batch_id, :chart_id, :model_name, :prediction_target_date, :code, :predicted_value, :updated_by, :updated_at)
+            INSERT INTO stock_predictions (prediction_batch_id, chart_id, model_name, prediction_target_date, code, predicted_value, predicted_volume, updated_by, updated_at)
+            VALUES (:prediction_batch_id, :chart_id, :model_name, :prediction_target_date, :code, :predicted_value, :predicted_volume, :updated_by, :updated_at)
             """
         )
         connection.execute(query, records_to_insert)
@@ -157,9 +164,9 @@ def save_run_evaluations(
             {
                 "prediction_batch_id": batch_id,
                 "model_name": result["model"],
-                "rmse": float(result["RMSE"]) if result.get("RMSE") is not None else None,
-                "mae": float(result["MAE"]) if result.get("MAE") is not None else None,
-                "r2_score": float(result["R2 Score"]) if result.get("R2 Score") is not None else None,
+                "rmse": float(result["RMSE"].item()) if isinstance(result["RMSE"], (np.ndarray, np.generic)) else (float(result["RMSE"]) if result.get("RMSE") is not None else None),
+                "mae": float(result["MAE"].item()) if isinstance(result["MAE"], (np.ndarray, np.generic)) else (float(result["MAE"]) if result.get("MAE") is not None else None),
+                "r2_score": float(result["R2 Score"].item()) if isinstance(result["R2 Score"], (np.ndarray, np.generic)) else (float(result["R2 Score"]) if result.get("R2 Score") is not None else None),
                 "updated_by": updated_by,
                 "updated_at": datetime.now(),
             }

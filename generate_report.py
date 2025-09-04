@@ -92,7 +92,7 @@ def get_evaluation_metrics(connection: Connection, batch_id: UUID) -> pd.DataFra
 def get_predictions(connection: Connection, batch_id: UUID) -> pd.DataFrame:
     """指定されたバッチIDの予測結果を取得します。"""
     query = text(
-        "SELECT model_name, prediction_target_date, predicted_value, actual_value FROM stock_predictions WHERE prediction_batch_id = :batch_id ORDER BY model_name, prediction_target_date"
+        """SELECT model_name, prediction_target_date, predicted_value, predicted_volume, actual_value FROM stock_predictions WHERE prediction_batch_id = :batch_id ORDER BY model_name, prediction_target_date"""
     )
     return pd.read_sql_query(query, connection, params={"batch_id": str(batch_id)})
 
@@ -146,7 +146,22 @@ def generate_text_report(
 
     if not predictions.empty:
         print("\n■ 予測結果詳細:")
-        print(predictions.to_string(index=False))
+        
+        # Create a multi-index pivot table
+        pivot_df = predictions.pivot_table(
+            index='prediction_target_date',
+            columns='model_name',
+            values=['predicted_value', 'predicted_volume']
+        )
+        
+        # Format the output
+        if 'predicted_value' in pivot_df.columns:
+            pivot_df['predicted_value'] = pivot_df['predicted_value'].round(2)
+        if 'predicted_volume' in pivot_df.columns:
+            pivot_df['predicted_volume'] = pivot_df['predicted_volume'].fillna(0).astype(int)
+
+        pivot_df.index = pd.to_datetime(pivot_df.index).strftime('%Y-%m-%d')
+        print(pivot_df.to_string())
     else:
         print("\n■ 予測結果詳細: データがありません。")
 
@@ -282,18 +297,37 @@ def generate_pdf_report(
     if not predictions.empty:
         story.append(Paragraph("予測結果詳細", styles["JapanH2"]))
         
-        # Pivot tableの作成
+        # --- 予測価格と出来高の統合テーブル ---
         pivot_df = predictions.pivot_table(
             index='prediction_target_date',
             columns='model_name',
-            values='predicted_value'
-        ).round(2)
+            values=['predicted_value', 'predicted_volume']
+        )
+
+        # カラムの順序を調整 (value -> volume)
+        pivot_df = pivot_df.reorder_levels([1, 0], axis=1).sort_index(axis=1)
         
-        # reportlabのTableに変換
+        # フォーマット
+        for model in pivot_df.columns.levels[0]:
+            pivot_df[(model, 'predicted_value')] = pivot_df[(model, 'predicted_value')].round(2)
+            pivot_df[(model, 'predicted_volume')] = pivot_df[(model, 'predicted_volume')].fillna(0).astype(int)
+
+        # ReportLabのテーブルデータを作成
         pivot_df.index = pd.to_datetime(pivot_df.index).strftime('%Y-%m-%d')
-        header = ["Date"] + pivot_df.columns.tolist()
-        data = [header] + [
-            [idx] + row for idx, row in zip(pivot_df.index, pivot_df.values.tolist())
+        header1 = ["Date"] + [col[0] for col in pivot_df.columns]
+        header2 = [""] + [col[1].replace('predicted_', '').capitalize() for col in pivot_df.columns]
+        
+        # ユニークなモデル名を取得し、ヘッダー1をマージ
+        unique_models = sorted(list(set(h for h in header1 if h != "Date")))
+        spans = []
+        for model in unique_models:
+            start = header1.index(model)
+            end = len(header1) - 1 - header1[::-1].index(model)
+            if start != end:
+                spans.append(('SPAN', (start, 0), (end, 0)))
+
+        data = [header1, header2] + [
+            [idx] + list(row) for idx, row in zip(pivot_df.index, pivot_df.values)
         ]
         
         pred_table = Table(data, hAlign="LEFT")
@@ -302,10 +336,11 @@ def generate_pdf_report(
                 [
                     ("FONT", (0, 0), (-1, -1), font_name, 10),
                     ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey), # Header row
-                    ("BACKGROUND", (0, 1), (0, -1), colors.lightgrey), # Index column
-                    ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
-                ]
+                    ("BACKGROUND", (0, 0), (-1, 1), colors.lightgrey),
+                    ("BACKGROUND", (0, 2), (0, -1), colors.lightgrey),
+                    ("ALIGN", (0, 0), (-1, 1), "CENTER"),
+                    ("ALIGN", (1, 2), (-1, -1), "RIGHT"),
+                ] + spans
             )
         )
         story.append(pred_table)

@@ -3,6 +3,7 @@ import random
 import sys
 import argparse
 import uuid
+import traceback
 
 import numpy as np
 import pandas as pd
@@ -11,7 +12,7 @@ from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import TensorDataset, DataLoader
 
 # Import refactored modules
-from data_processing import create_sequences
+from data_processing import create_sequences, add_technical_features, add_date_features
 from db_utils import (
     get_db_engine,
     get_stock_data,
@@ -34,7 +35,7 @@ random.seed(42)
 
 def main():
     # 引数を解析
-    parser = argparse.ArgumentParser(description="株価予測チャートを作成します。")
+    parser = argparse.ArgumentParser(description="株価予測チャートを作成します。 সন")
     parser.add_argument("--stock_code", type=str, default="9432", help="証券コード")
     parser.add_argument(
         "--model_type",
@@ -89,33 +90,37 @@ def main():
     # --- 1. 特徴量エンジニアリング ---
     df["record_date"] = pd.to_datetime(df["record_date"])
     df.set_index("record_date", inplace=True)
+
+    # 時間枠に応じてリサンプリング
+    ohlc_dict = {
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last',
+        'volume': 'sum'
+    }
     if args.time_frame == "daily":
-        df = df.resample("D").last()
+        df = df.resample("B").agg(ohlc_dict)
     else:
-        df = df.resample("W").last()
+        df = df.resample("W").agg(ohlc_dict)
+    
     df.reset_index(inplace=True)
-    df.dropna(subset=["close", "volume"], inplace=True)
+    df.dropna(subset=['open', 'high', 'low', 'close', 'volume'], inplace=True)
 
-    df["day_of_week"] = df["record_date"].dt.dayofweek
-    df["day_of_month"] = df["record_date"].dt.day
-    df["month"] = df["record_date"].dt.month
-    df["year"] = df["record_date"].dt.year
-    df["day_of_year"] = df["record_date"].dt.dayofyear
-    df["week_of_year"] = df["record_date"].dt.isocalendar().week.astype(int)
+    # 特徴量生成関数を呼び出す
+    df = add_technical_features(df)
+    df = add_date_features(df)
 
-    for col, max_val in [
-        ("day_of_week", 7),
-        ("day_of_month", 31),
-        ("month", 12),
-        ("day_of_year", 366),
-        ("week_of_year", 53),
-    ]:
-        df[f"{col}_sin"] = np.sin(2 * np.pi * df[col] / max_val)
-        df[f"{col}_cos"] = np.cos(2 * np.pi * df[col] / max_val)
+    # 特徴量生成で発生したNaNを持つ行を削除
+    df.dropna(inplace=True)
+
+    # Volumeが0の異常データを学習から除外
+    df = df[df['volume'] > 0].copy()
 
     # --- 2. 特徴量とスケーリング ---
     feature_columns = [
-        "close", "volume",
+        "close", "open", "high", "low", "volume",
+        "price_change_ratio", "price_range_ratio", "rsi",
         "day_of_week_sin", "day_of_week_cos",
         "day_of_month_sin", "day_of_month_cos",
         "month_sin", "month_cos",
@@ -154,7 +159,12 @@ def main():
                         print(f"\n--- Running prediction for model: {model_type} ---")
 
                         # --- 3. シーケンス作成とデータ分割 ---
-                        X, y = create_sequences(features_scaled, args.seq_length)
+                        close_idx = feature_columns.index('close')
+                        volume_idx = feature_columns.index('volume')
+                        
+                        # スケール済みデータからシーケンスを作成
+                        df_scaled = pd.DataFrame(features_scaled, columns=feature_columns)
+                        X, y = create_sequences(df_scaled.values, args.seq_length, close_idx=close_idx, volume_idx=volume_idx)
 
                         test_period = args.fut_pred
                         X_train, y_train = X[:-test_period], y[:-test_period]
@@ -176,7 +186,8 @@ def main():
                         model = get_model(
                             model_type=model_type,
                             input_dim=len(feature_columns),
-                            seq_length=args.seq_length
+                            seq_length=args.seq_length,
+                            output_dim=2
                         ).to(device)
 
                         model = train_model(model, train_loader, args.epochs, device)
@@ -188,15 +199,28 @@ def main():
                         metrics["model"] = model_type
                         evaluation_results.append(metrics)
 
-                        predictions = predict_future_values(
+                        # 予測関数にはスケール前のdfを渡すように変更
+                        predictions, pred_volumes = predict_future_values(
                             model,
-                            features_scaled,
+                            df.copy(), # スケール前の元データを渡す
                             future_dates,
                             scaler,
                             args.seq_length,
                             device,
                             feature_columns,
                         )
+
+                        # Ensure predictions and pred_volumes are Python native lists of scalars
+                        predictions_list = predictions.flatten().tolist()
+                        pred_volumes_list = pred_volumes.flatten().tolist()
+
+                        print(f"\n--- 予測詳細 (モデル: {model_type}) ---")
+                        details_df = pd.DataFrame({
+                            'Date': future_dates,
+                            'Prediction': predictions_list,
+                            'Assumed Volume': pred_volumes_list
+                        })
+                        print(details_df.to_string(index=False))
 
                         chart_binary = plot_prediction_chart(
                             df,
@@ -211,7 +235,7 @@ def main():
                                 "predictions": backtest_predictions,
                             },
                         )
-                        print(f"グラフをメモリ上に生成しました。")
+                        print(f"グラフをメモリ上に生成しました。 সন")
 
                         chart_id = save_prediction_chart(
                             connection, prediction_batch_id, model_type, chart_binary, updated_by_script
@@ -219,7 +243,11 @@ def main():
 
                         if chart_id:
                             predictions_df = pd.DataFrame(
-                                {"date": future_dates, "prediction": predictions.flatten()}
+                                {
+                                    "date": future_dates, 
+                                    "prediction": predictions.flatten(),
+                                    "volume": pred_volumes.flatten(),
+                                }
                             )
                             save_stock_predictions(
                                 connection,
@@ -238,13 +266,13 @@ def main():
 
                 except Exception as e:
                     print(f"\n--- トランザクション内でエラーが発生しました。処理をロールバックします。 ---")
-                    print(f"エラー詳細: {e}")
+                    traceback.print_exc()
                     transaction.rollback()
                     raise
 
     except Exception as e:
         print(f"\n--- データベース接続またはトランザクション開始に失敗しました。 ---")
-        print(f"エラー詳細: {e}")
+        traceback.print_exc()
 
     # --- 6. 最終評価結果の表示 ---
     if evaluation_results and len(evaluation_results) > 1:
@@ -252,9 +280,9 @@ def main():
         print("\n--- 全モデルの最終評価結果 ---")
         print(results_df.round(4))
         print("\n--- 評価指標の見方 ---")
-        print("RMSE (二乗平均平方根誤差): 値が小さいほど良いです。")
-        print("MAE (平均絶対誤差): 値が小さいほど良いです。")
-        print("R2スコア (決定係数): 値が1に近いほど良いです。")
+        print("RMSE (二乗平均平方根誤差): 値が小さいほど良いです。 সন")
+        print("MAE (平均絶対誤差): 値が小さいほど良いです。 সন")
+        print("R2スコア (決定係数): 値が1に近いほど良いです。 সন")
         print("----------------------")
         best_model = results_df["R2 Score"].idxmax()
         print(f"\n最も優れたモデル (R2スコア基準): {best_model}")

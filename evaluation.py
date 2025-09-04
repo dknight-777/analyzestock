@@ -24,8 +24,8 @@ def evaluate_model(
         for seq, labels in test_loader:
             seq, labels = seq.to(device), labels.to(device)
             y_pred = model(seq)
-            predictions_normalized.extend(y_pred.cpu().numpy())
-            actuals_normalized.extend(labels.cpu().numpy())
+            predictions_normalized.extend(y_pred[:, 0].cpu().numpy())
+            actuals_normalized.extend(labels[:, 0].cpu().numpy())
 
     # スケールを元に戻す
     # 予測値と実績値の両方を、元の多次元の形に擬似的に復元してからinverse_transformを呼び出す
