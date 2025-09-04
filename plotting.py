@@ -80,6 +80,8 @@ def plot_prediction_chart(
             "close": predictions.flatten()
         })
         predicted_annotation_df["numerical_index"] = range(len(plot_df), len(plot_df) + len(predictions))
+        # Ensure 'close' column contains scalar Python floats
+        predicted_annotation_df["close"] = predicted_annotation_df["close"].astype(float)
         annotation_dfs.append((predicted_annotation_df, "orange"))
 
     for data_frame, color in annotation_dfs:
