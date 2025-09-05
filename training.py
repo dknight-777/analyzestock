@@ -77,54 +77,73 @@ def predict_future_values(
     """学習済みモデルを使用して将来の値を予測します。特徴量を動的に再計算します。"""
     model.eval()
 
-    # --- 特徴量のインデックスを取得 ---
     close_col_idx = feature_columns.index("close")
     volume_col_index = feature_columns.index("volume")
 
-    # --- 平均的なローソク足の形状を計算 ---
     open_offset = (historical_df['open'] - historical_df['close']).mean()
     high_offset = (historical_df['high'] - historical_df['close']).mean()
     low_offset = (historical_df['low'] - historical_df['close']).mean()
 
-    # 予測プロセス用のデータフレームを準備
     predictions_df = historical_df.copy()
 
     for date in future_dates:
-        # --- 1. 最後のシーケンスを取得してスケール変換 ---
-        # スケーラーにDataFrameを直接渡すように修正
         last_sequence = predictions_df[feature_columns].tail(seq_length)
         last_sequence_scaled = scaler.transform(last_sequence)
         
         seq = torch.from_numpy(last_sequence_scaled).float().unsqueeze(0).to(device)
 
         with torch.no_grad():
-            # --- 2. 1期先を予測 ---
             prediction_normalized = model(seq)[0].cpu().numpy()
-
-            # --- ★★★ 安定化のためのクリッピング処理 ★★★ ---
             prediction_normalized = np.clip(prediction_normalized, 0, 1)
 
-            # --- 3. 予測値を逆変換して実際の値を取得 ---
             dummy_array = np.zeros((1, len(feature_columns)))
             dummy_array[0, close_col_idx] = prediction_normalized[0]
             dummy_array[0, volume_col_index] = prediction_normalized[1]
             inversed_pred = scaler.inverse_transform(dummy_array)
-            
             predicted_close = inversed_pred[0, close_col_idx]
-            predicted_volume = inversed_pred[0, volume_col_index]
 
-            # --- 4. 新しい行を作成 ---
+            # --- ユーザー提供のロジックで出来高を決定 ---
+            price_change_threshold = 0.005 # 0.5%の変動を「横ばい」の閾値とする
+            last_close = predictions_df['close'].iloc[-1]
+            price_change_ratio = (predicted_close - last_close) / last_close
+
+            if abs(price_change_ratio) < price_change_threshold:
+                # 横ばいの場合: 5営業日前の出来高を使用
+                if len(predictions_df) >= 5:
+                    predicted_volume = predictions_df['volume'].iloc[-5]
+                else:
+                    # データが5日未満の場合は利用可能な最も古いデータを使用
+                    predicted_volume = predictions_df['volume'].iloc[0]
+            else:
+                # トレンドがある場合: 過去の同じ価格帯の出来高の平均を使用
+                price_range_margin = 0.01 # 1%の価格帯マージン
+                price_min = predicted_close * (1 - price_range_margin)
+                price_max = predicted_close * (1 + price_range_margin)
+                
+                similar_days = historical_df[
+                    (historical_df['close'] >= price_min) & (historical_df['close'] <= price_max)
+                ]
+                
+                if not similar_days.empty:
+                    predicted_volume = similar_days['volume'].mean()
+                else:
+                    # 該当する過去データがない場合は5営業日前の出来高を使用
+                    if len(predictions_df) >= 5:
+                        predicted_volume = predictions_df['volume'].iloc[-5]
+                    else:
+                        predicted_volume = predictions_df['volume'].iloc[0]
+            
+            # --- 新しい行を作成 ---
             new_row_data = {
                 'record_date': date,
                 'close': predicted_close,
-                'volume': max(0, predicted_volume),
+                'volume': predicted_volume,
                 'open': predicted_close + open_offset,
                 'high': max(predicted_close, predicted_close + high_offset),
                 'low': min(predicted_close, predicted_close + low_offset),
             }
             new_row_df = pd.DataFrame([new_row_data])
             
-            # --- 5. 特徴量を再計算してDataFrameに追加 ---
             predictions_df = pd.concat([predictions_df, new_row_df], ignore_index=True)
             
             predictions_df = add_date_features(predictions_df)
@@ -133,7 +152,6 @@ def predict_future_values(
             predictions_df[feature_columns] = predictions_df[feature_columns].ffill()
             predictions_df[feature_columns] = predictions_df[feature_columns].bfill()
 
-    # --- 6. 最終的な予測値を抽出 ---
     future_predictions = predictions_df[predictions_df['record_date'].isin(future_dates)]
     predicted_prices = future_predictions['close'].values
     predicted_volumes = future_predictions['volume'].values
