@@ -6,3 +6,4 @@ __pycache__/
 stock_prediction_charts/
 *.bak
 reports/
+venv/
