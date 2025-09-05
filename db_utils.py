@@ -8,6 +8,10 @@ import argparse
 import pandas as pd
 import numpy as np
 from sqlalchemy import create_engine, text, Engine, Connection
+from dotenv import load_dotenv
+
+# .envファイルから環境変数を読み込む
+load_dotenv()
 
 # データベース接続情報
 # --- Database Connection Details ---
