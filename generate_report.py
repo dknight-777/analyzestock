@@ -10,6 +10,7 @@ from sqlalchemy import text, Engine, Connection
 
 # Import from existing modules
 from db_utils import get_db_engine
+from create_stock_prediction_chart import __version__
 
 # PDF出力用のライブラリ
 REPORTLAB_AVAILABLE = False
@@ -358,8 +359,6 @@ def generate_pdf_report(
 
     doc.build(story)
     print(f"PDFレポートを {pdf_file} に保存しました。")
-
-
 
 
 def main():

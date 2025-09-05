@@ -26,6 +26,9 @@ from plotting import plot_prediction_chart
 from training import train_model, predict_future_values
 from evaluation import evaluate_model
 
+# --- Program Version ---
+__version__ = "0.5"
+
 # 再現性のためのシード固定
 # --- Seed for reproducibility ---
 torch.manual_seed(42)
@@ -34,6 +37,9 @@ random.seed(42)
 
 
 def main():
+    # --- バージョン情報を表示 ---
+    print(f"Stock Price Prediction v{__version__}\n---")
+
     # 引数を解析
     parser = argparse.ArgumentParser(description="株価予測チャートを作成します。 সন")
     parser.add_argument("--stock_code", type=str, default="9432", help="証券コード")
