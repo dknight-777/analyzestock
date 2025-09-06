@@ -27,7 +27,7 @@ from training import train_model, predict_future_values
 from evaluation import evaluate_model
 
 # --- Program Version ---
-__version__ = "0.5"
+__version__ = "0.7"
 
 # 再現性のためのシード固定
 # --- Seed for reproducibility ---
@@ -41,7 +41,7 @@ def main():
     print(f"Stock Price Prediction v{__version__}\n---")
 
     # 引数を解析
-    parser = argparse.ArgumentParser(description="株価予測チャートを作成します。 সন")
+    parser = argparse.ArgumentParser(description="株価予測チャートを作成します。")
     parser.add_argument("--stock_code", type=str, default="9432", help="証券コード")
     parser.add_argument(
         "--model_type",
@@ -60,11 +60,13 @@ def main():
     parser.add_argument("--epochs", type=int, default=150, help="学習のエポック数")
     parser.add_argument("--seq_length", type=int, default=30, help="シーケンス長")
     parser.add_argument("--fut_pred", type=int, default=5, help="予測期間（営業日数）")
+    parser.add_argument("--hidden_layer_size", type=int, default=128, help="隠れ層のサイズ")
+    parser.add_argument("--num_layers", type=int, default=2, help="RNN層の数")
     parser.add_argument(
         "--device",
         type=str,
         choices=["cpu", "cuda"],
-        default=None, # デフォルトはNoneにして後で設定
+        default=None,
         help="使用するデバイス (cpu or cuda)",
     )
     args = parser.parse_args()
@@ -97,60 +99,44 @@ def main():
     df["record_date"] = pd.to_datetime(df["record_date"])
     df.set_index("record_date", inplace=True)
 
-    # 時間枠に応じてリサンプリング
     ohlc_dict = {
-        'open': 'first',
-        'high': 'max',
-        'low': 'min',
-        'close': 'last',
-        'volume': 'sum'
+        'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
     }
-    if args.time_frame == "daily":
-        df = df.resample("B").agg(ohlc_dict)
-    else:
-        df = df.resample("W").agg(ohlc_dict)
-    
+    df = df.resample("B" if args.time_frame == "daily" else "W").agg(ohlc_dict)
     df.reset_index(inplace=True)
     df.dropna(subset=['open', 'high', 'low', 'close', 'volume'], inplace=True)
 
-    # 特徴量生成関数を呼び出す
     df = add_technical_features(df)
     df = add_date_features(df)
-
-    # 特徴量生成で発生したNaNを持つ行を削除
     df.dropna(inplace=True)
-
-    # Volumeが0の異常データを学習から除外
     df = df[df['volume'] > 0].copy()
 
-    # --- 2. 特徴量とスケーリング ---
+    # --- 2. データ分割とスケーリング ---
     feature_columns = [
-        "close", "open", "high", "low", "volume",
-        "price_change_ratio", "price_range_ratio", "rsi",
-        "day_of_week_sin", "day_of_week_cos",
-        "day_of_month_sin", "day_of_month_cos",
-        "month_sin", "month_cos",
-        "day_of_year_sin", "day_of_year_cos",
-        "week_of_year_sin", "week_of_year_cos",
-        "year"
+        "close", "open", "high", "low", "volume", "price_change_ratio", "price_range_ratio", "rsi", "atr", "rci",
+        "bb_upper", "bb_middle", "bb_lower", "bb_width", "bb_percent",
+        "day_of_week_sin", "day_of_week_cos", "day_of_month_sin", "day_of_month_cos",
+        "month_sin", "month_cos", "day_of_year_sin", "day_of_year_cos",
+        "week_of_year_sin", "week_of_year_cos", "year", "log_return"
     ]
-    features = df[feature_columns].copy()
     
-    # 全特徴量のスケーラー
+    test_size = 30
+    if len(df) <= test_size + args.seq_length:
+        print("データが少なく、学習と評価を分割できません。")
+        sys.exit(1)
+
+    train_df = df.iloc[:-test_size].copy()
+    test_df = df.iloc[-test_size:].copy()
+
     scaler = MinMaxScaler()
-    features_scaled = scaler.fit_transform(features)
+    scaler.fit(train_df[feature_columns])
+
+    train_scaled = scaler.transform(train_df[feature_columns])
+    test_scaled = scaler.transform(test_df[feature_columns])
 
     # --- モデル学習・評価・予測ループ ---
-    models_to_run = (
-        [args.model_type]
-        if args.model_type
-        else ["lstm", "nn", "gru"]
-    )
-    
-    future_dates = pd.bdate_range(
-        start=df["record_date"].max() + pd.offsets.BDay(), periods=args.fut_pred
-    )
-
+    models_to_run = [args.model_type] if args.model_type else ["lstm", "nn", "gru"]
+    future_dates = pd.bdate_range(start=df["record_date"].max() + pd.offsets.BDay(), periods=args.fut_pred)
     evaluation_results = []
     updated_by_script = os.path.basename(__file__)
 
@@ -164,17 +150,14 @@ def main():
                     for model_type in models_to_run:
                         print(f"\n--- Running prediction for model: {model_type} ---")
 
-                        # --- 3. シーケンス作成とデータ分割 ---
-                        close_idx = feature_columns.index('close')
-                        volume_idx = feature_columns.index('volume')
-                        
-                        # スケール済みデータからシーケンスを作成
-                        df_scaled = pd.DataFrame(features_scaled, columns=feature_columns)
-                        X, y = create_sequences(df_scaled.values, args.seq_length, close_idx=close_idx, volume_idx=volume_idx)
+                        # --- 3. シーケンス作成 ---
+                        log_return_idx = feature_columns.index('log_return')
 
-                        test_period = args.fut_pred
-                        X_train, y_train = X[:-test_period], y[:-test_period]
-                        X_test, y_test = X[-test_period:], y[-test_period:]
+                        X_train, y_train = create_sequences(train_scaled, args.seq_length, log_return_idx)
+                        
+                        padding_for_test = train_scaled[-args.seq_length:]
+                        combined_for_test = np.concatenate([padding_for_test, test_scaled])
+                        X_test, y_test = create_sequences(combined_for_test, args.seq_length, log_return_idx)
 
                         X_train_tensor = torch.from_numpy(X_train).float()
                         y_train_tensor = torch.from_numpy(y_train).float()
@@ -193,76 +176,51 @@ def main():
                             model_type=model_type,
                             input_dim=len(feature_columns),
                             seq_length=args.seq_length,
-                            output_dim=2
+                            output_dim=1,
+                            hidden_layer_size=args.hidden_layer_size,
+                            num_layers=args.num_layers
                         ).to(device)
 
                         model = train_model(model, train_loader, args.epochs, device)
 
                         # --- 5. 評価と予測 ---
+                        close_idx = feature_columns.index('close')
                         backtest_predictions, metrics = evaluate_model(
-                            model, test_loader, scaler, device, len(feature_columns)
+                            model, test_loader, scaler, device, len(feature_columns), close_idx, log_return_idx, test_df
                         )
                         metrics["model"] = model_type
                         evaluation_results.append(metrics)
 
-                        # 予測関数にはスケール前のdfを渡すように変更
                         predictions, pred_volumes = predict_future_values(
-                            model,
-                            df.copy(), # スケール前の元データを渡す
-                            future_dates,
-                            scaler,
-                            args.seq_length,
-                            device,
-                            feature_columns,
+                            model, df.copy(), future_dates, scaler, args.seq_length, device, feature_columns, log_return_idx
                         )
 
-                        # Ensure predictions and pred_volumes are Python native lists of scalars
                         predictions_list = predictions.flatten().tolist()
                         pred_volumes_list = pred_volumes.flatten().tolist()
 
                         print(f"\n--- 予測詳細 (モデル: {model_type}) ---")
                         details_df = pd.DataFrame({
-                            'Date': future_dates,
-                            'Prediction': predictions_list,
-                            'Assumed Volume': pred_volumes_list
+                            'Date': future_dates, 'Prediction': predictions_list, 'Assumed Volume': pred_volumes_list
                         })
                         print(details_df.to_string(index=False))
 
                         chart_binary = plot_prediction_chart(
-                            df,
-                            predictions,
-                            future_dates,
-                            args.stock_code,
-                            stock_name,
-                            model_type,
-                            args.time_frame,
+                            df, predictions, future_dates, args.stock_code, stock_name, model_type, args.time_frame,
                             backtest_data={
-                                "dates": df["record_date"].tail(len(backtest_predictions)),
+                                "dates": test_df["record_date"].iloc[1:len(backtest_predictions) + 1],
                                 "predictions": backtest_predictions,
                             },
                         )
-                        print(f"グラフをメモリ上に生成しました。 সন")
+                        print(f"グラフをメモリ上に生成しました。")
 
-                        chart_id = save_prediction_chart(
-                            connection, prediction_batch_id, model_type, chart_binary, updated_by_script
-                        )
+                        chart_id = save_prediction_chart(connection, prediction_batch_id, model_type, chart_binary, updated_by_script)
 
                         if chart_id:
-                            predictions_df = pd.DataFrame(
-                                {
-                                    "date": future_dates, 
-                                    "prediction": predictions.flatten(),
-                                    "volume": pred_volumes.flatten(),
-                                }
-                            )
+                            predictions_df = pd.DataFrame({
+                                "date": future_dates, "prediction": predictions.flatten(), "volume": pred_volumes.flatten()
+                            })
                             save_stock_predictions(
-                                connection,
-                                prediction_batch_id,
-                                chart_id,
-                                model_type,
-                                args.stock_code,
-                                predictions_df,
-                                updated_by_script,
+                                connection, prediction_batch_id, chart_id, model_type, args.stock_code, predictions_df, updated_by_script
                             )
                     
                     if evaluation_results:
@@ -281,18 +239,19 @@ def main():
         traceback.print_exc()
 
     # --- 6. 最終評価結果の表示 ---
-    if evaluation_results and len(evaluation_results) > 1:
+    if evaluation_results:
         results_df = pd.DataFrame(evaluation_results).set_index("model")
         print("\n--- 全モデルの最終評価結果 ---")
         print(results_df.round(4))
         print("\n--- 評価指標の見方 ---")
-        print("RMSE (二乗平均平方根誤差): 値が小さいほど良いです。 সন")
-        print("MAE (平均絶対誤差): 値が小さいほど良いです。 সন")
-        print("R2スコア (決定係数): 値が1に近いほど良いです。 সন")
+        print("RMSE (二乗平均平方根誤差): 値が小さいほど良いです。")
+        print("MAE (平均絶対誤差): 値が小さいほど良いです。")
+        print("R2スコア (決定係数): 値が1に近いほど良いです。")
         print("----------------------")
-        best_model = results_df["R2 Score"].idxmax()
-        print(f"\n最も優れたモデル (R2スコア基準): {best_model}")
-        print("---------------------------------")
+        if len(results_df) > 1:
+            best_model = results_df["R2 Score"].idxmax()
+            print(f"\n最も優れたモデル (R2スコア基準): {best_model}")
+            print("---------------------------------")
 
 if __name__ == "__main__":
     main()
