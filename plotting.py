@@ -43,6 +43,13 @@ def plot_prediction_chart(
     # Plot actual stock price using numerical index
     plt.plot(range(len(plot_df)), plot_df["close"], label="実際の株価", color="blue")
 
+    # Plot Bollinger Bands if they exist
+    if all(col in plot_df.columns for col in ['bb_upper', 'bb_middle', 'bb_lower']):
+        # Plot the middle band
+        plt.plot(range(len(plot_df)), plot_df['bb_middle'], linestyle='--', color='gray', alpha=0.7, label='ボリンジャーバンド (中央)')
+        # Shade the area between the upper and lower bands
+        plt.fill_between(range(len(plot_df)), plot_df['bb_lower'], plot_df['bb_upper'], color='gray', alpha=0.2, label='ボリンジャーバンド (±2σ)')
+
     # Plot future predictions using numerical index, offset by length of actual data
     # Prepend the last actual close value to predictions to create a continuous line
     # The x-coordinate for this point will be len(plot_df) - 1
