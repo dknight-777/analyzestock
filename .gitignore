@@ -1,6 +1,7 @@
 __pycache__/
 .mypy_cache/
 .vscode/
+.gemini/
 .devcontainer/
 .env
 stock_prediction_charts/

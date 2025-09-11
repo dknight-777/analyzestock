@@ -89,7 +89,7 @@ def get_evaluation_metrics(connection: Connection, batch_id: UUID) -> pd.DataFra
 def get_predictions(connection: Connection, batch_id: UUID) -> pd.DataFrame:
     """指定されたバッチIDの予測結果を取得します。"""
     query = text(
-        """SELECT model_name, prediction_target_date, predicted_value FROM stock_predictions WHERE prediction_batch_id = :batch_id ORDER BY model_name, prediction_target_date"""
+        """SELECT model_name, prediction_target_date, predicted_value, predicted_volume FROM stock_predictions WHERE prediction_batch_id = :batch_id ORDER BY model_name, prediction_target_date"""
     )
     return pd.read_sql_query(query, connection, params={"batch_id": str(batch_id)})
 
@@ -146,8 +146,16 @@ def generate_text_report(
         pivot_df = predictions.pivot_table(
             index='prediction_target_date',
             columns='model_name',
-            values='predicted_value'
-        ).round(2)
+            values=['predicted_value', 'predicted_volume']
+        )
+        pivot_df = pivot_df.swaplevel(0, 1, axis=1)
+        pivot_df.sort_index(axis=1, inplace=True)
+
+        # Round values
+        for model in pivot_df.columns.levels[0]:
+            pivot_df[(model, 'predicted_value')] = pivot_df[(model, 'predicted_value')].round(2)
+            pivot_df[(model, 'predicted_volume')] = pivot_df[(model, 'predicted_volume')].astype(int)
+
         pivot_df.index = pd.to_datetime(pivot_df.index).strftime('%Y-%m-%d')
         print(pivot_df.to_string())
     else:
@@ -251,23 +259,43 @@ def generate_pdf_report(
         pivot_df = predictions.pivot_table(
             index='prediction_target_date',
             columns='model_name',
-            values='predicted_value'
-        ).round(2)
+            values=['predicted_value', 'predicted_volume']
+        )
+        pivot_df = pivot_df.swaplevel(0, 1, axis=1)
+        pivot_df.sort_index(axis=1, inplace=True)
+
+        # Round values
+        for model in pivot_df.columns.levels[0]:
+            pivot_df[(model, 'predicted_value')] = pivot_df[(model, 'predicted_value')].round(2)
+            pivot_df[(model, 'predicted_volume')] = pivot_df[(model, 'predicted_volume')].astype(int)
+
         pivot_df.index = pd.to_datetime(pivot_df.index).strftime('%Y-%m-%d')
+
+        # Prepare data for ReportLab Table
+        header1 = [""] + [model for model in pivot_df.columns.levels[0] for _ in range(2)]
+        header2 = ["Date"] + [col[1].replace("predicted_", "") for col in pivot_df.columns]
         
-        header = ["Date"] + pivot_df.columns.tolist()
-        data = [header] + [
+        data = [header1, header2] + [
             [idx] + list(row) for idx, row in zip(pivot_df.index, pivot_df.values)
         ]
-        
+
         pred_table = Table(data, hAlign="LEFT")
-        pred_table.setStyle(TableStyle([
+        style = [
             ("FONT", (0, 0), (-1, -1), font_name, 10),
             ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-            ("BACKGROUND", (0, 1), (0, -1), colors.lightgrey),
-            ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
-        ]))
+            ("BACKGROUND", (0, 0), (-1, 1), colors.lightgrey),
+            ("BACKGROUND", (0, 2), (0, -1), colors.lightgrey),
+            ("ALIGN", (1, 0), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ]
+
+        # Add SPAN commands for the first header row
+        for i, model in enumerate(pivot_df.columns.levels[0]):
+            start = i * 2 + 1
+            end = start + 1
+            style.append(("SPAN", (start, 0), (end, 0)))
+        
+        pred_table.setStyle(TableStyle(style))
         story.append(pred_table)
         story.append(Spacer(1, 12))
 
