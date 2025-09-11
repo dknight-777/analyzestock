@@ -12,7 +12,7 @@ from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import TensorDataset, DataLoader
 
 # Import refactored modules
-from data_processing import create_sequences, add_technical_features, add_date_features
+from data_processing import create_sequences, add_technical_features, add_date_features, add_dow_theory_features
 from db_utils import (
     get_db_engine,
     get_stock_data,
@@ -53,14 +53,20 @@ def main():
     parser.add_argument(
         "--time_frame",
         type=str,
-        choices=["daily", "weekly"],
+        choices=["daily", "weekly", "monthly"],
         default="daily",
-        help="時間枠 (daily or weekly)",
+        help="時間枠 (daily, weekly, monthly)",
     )
     parser.add_argument("--epochs", type=int, default=150, help="学習のエポック数")
+    parser.add_argument(
+        "--log_interval", type=int, default=5, help="学習の進捗を表示する間隔"
+    )
     parser.add_argument("--seq_length", type=int, default=30, help="シーケンス長")
     parser.add_argument("--fut_pred", type=int, default=5, help="予測期間（営業日数）")
-    parser.add_argument("--hidden_layer_size", type=int, default=128, help="隠れ層のサイズ")
+    parser.add_argument("--batch_size", type=int, default=32, help="バッチサイズ")
+    parser.add_argument(
+        "--hidden_layer_size", type=int, default=128, help="隠れ層のサイズ"
+    )
     parser.add_argument("--num_layers", type=int, default=2, help="RNN層の数")
     parser.add_argument(
         "--device",
@@ -99,27 +105,65 @@ def main():
     df["record_date"] = pd.to_datetime(df["record_date"])
     df.set_index("record_date", inplace=True)
 
-    ohlc_dict = {
-        'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+    time_frame_options = {
+        "daily": {"freq": "B", "offset": pd.offsets.BDay()},
+        "weekly": {"freq": "W", "offset": pd.offsets.Week()},
+        "monthly": {"freq": "ME", "offset": pd.offsets.MonthEnd()},
     }
-    df = df.resample("B" if args.time_frame == "daily" else "W").agg(ohlc_dict)
+    resample_freq = time_frame_options[args.time_frame]["freq"]
+
+    ohlc_dict = {
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    }
+    df = df.resample(resample_freq).agg(ohlc_dict)
     df.reset_index(inplace=True)
-    df.dropna(subset=['open', 'high', 'low', 'close', 'volume'], inplace=True)
+    df.dropna(subset=["open", "high", "low", "close", "volume"], inplace=True)
 
     df = add_technical_features(df)
     df = add_date_features(df)
+    df = add_dow_theory_features(df)
     df.dropna(inplace=True)
-    df = df[df['volume'] > 0].copy()
+    df = df[df["volume"] > 0].copy()
 
     # --- 2. データ分割とスケーリング ---
     feature_columns = [
-        "close", "open", "high", "low", "volume", "price_change_ratio", "price_range_ratio", "rsi", "atr", "rci",
-        "bb_upper", "bb_middle", "bb_lower", "bb_width", "bb_percent",
-        "day_of_week_sin", "day_of_week_cos", "day_of_month_sin", "day_of_month_cos",
-        "month_sin", "month_cos", "day_of_year_sin", "day_of_year_cos",
-        "week_of_year_sin", "week_of_year_cos", "year", "log_return"
+        "close",
+        "open",
+        "high",
+        "low",
+        "volume",
+        "price_change_ratio",
+        "price_range_ratio",
+        "rsi",
+        "atr",
+        "rci",
+        "bb_upper",
+        "bb_middle",
+        "bb_lower",
+        "bb_width",
+        "bb_percent",
+        "macd",
+        "macd_signal",
+        "macd_hist",
+        "day_of_week_sin",
+        "day_of_week_cos",
+        "day_of_month_sin",
+        "day_of_month_cos",
+        "month_sin",
+        "month_cos",
+        "day_of_year_sin",
+        "day_of_year_cos",
+        "week_of_year_sin",
+        "week_of_year_cos",
+        "year",
+        "log_return",
+        "dow_trend",
     ]
-    
+
     test_size = 30
     if len(df) <= test_size + args.seq_length:
         print("データが少なく、学習と評価を分割できません。")
@@ -136,28 +180,43 @@ def main():
 
     # --- モデル学習・評価・予測ループ ---
     models_to_run = [args.model_type] if args.model_type else ["lstm", "nn", "gru"]
-    future_dates = pd.bdate_range(start=df["record_date"].max() + pd.offsets.BDay(), periods=args.fut_pred)
+
+    date_offset = time_frame_options[args.time_frame]["offset"]
+    future_dates = pd.date_range(
+        start=df["record_date"].max() + date_offset, periods=args.fut_pred, freq=date_offset
+    )
+
     evaluation_results = []
     updated_by_script = os.path.basename(__file__)
 
     try:
         with engine.connect() as connection:
             with connection.begin() as transaction:
-                print("\n--- データベースへの保存処理を開始します（トランザクション開始） ---")
+                print(
+                    "\n--- データベースへの保存処理を開始します（トランザクション開始） ---"
+                )
                 try:
-                    save_prediction_run(connection, prediction_batch_id, args, updated_by_script)
+                    save_prediction_run(
+                        connection, prediction_batch_id, args, updated_by_script
+                    )
 
                     for model_type in models_to_run:
                         print(f"\n--- Running prediction for model: {model_type} ---")
 
                         # --- 3. シーケンス作成 ---
-                        log_return_idx = feature_columns.index('log_return')
+                        log_return_idx = feature_columns.index("log_return")
 
-                        X_train, y_train = create_sequences(train_scaled, args.seq_length, log_return_idx)
-                        
-                        padding_for_test = train_scaled[-args.seq_length:]
-                        combined_for_test = np.concatenate([padding_for_test, test_scaled])
-                        X_test, y_test = create_sequences(combined_for_test, args.seq_length, log_return_idx)
+                        X_train, y_train = create_sequences(
+                            train_scaled, args.seq_length, log_return_idx
+                        )
+
+                        padding_for_test = train_scaled[-args.seq_length :]
+                        combined_for_test = np.concatenate(
+                            [padding_for_test, test_scaled]
+                        )
+                        X_test, y_test = create_sequences(
+                            combined_for_test, args.seq_length, log_return_idx
+                        )
 
                         X_train_tensor = torch.from_numpy(X_train).float()
                         y_train_tensor = torch.from_numpy(y_train).float()
@@ -167,10 +226,16 @@ def main():
                         train_data = TensorDataset(X_train_tensor, y_train_tensor)
                         test_data = TensorDataset(X_test_tensor, y_test_tensor)
 
-                        batch_size = 32
-                        train_loader = DataLoader(train_data, shuffle=False, batch_size=batch_size, drop_last=True)
-                        test_loader = DataLoader(test_data, shuffle=False, batch_size=batch_size)
-                        
+                        train_loader = DataLoader(
+                            train_data,
+                            shuffle=False,
+                            batch_size=args.batch_size,
+                            drop_last=True,
+                        )
+                        test_loader = DataLoader(
+                            test_data, shuffle=False, batch_size=args.batch_size
+                        )
+
                         # --- 4. モデルの取得と学習 ---
                         model = get_model(
                             model_type=model_type,
@@ -178,58 +243,115 @@ def main():
                             seq_length=args.seq_length,
                             output_dim=1,
                             hidden_layer_size=args.hidden_layer_size,
-                            num_layers=args.num_layers
+                            num_layers=args.num_layers,
                         ).to(device)
 
-                        model = train_model(model, train_loader, args.epochs, device)
+                        model = train_model(
+                            model,
+                            train_loader,
+                            args.epochs,
+                            device,
+                            log_interval=args.log_interval,
+                        )
 
                         # --- 5. 評価と予測 ---
-                        close_idx = feature_columns.index('close')
+                        close_idx = feature_columns.index("close")
                         backtest_predictions, metrics = evaluate_model(
-                            model, test_loader, scaler, device, len(feature_columns), close_idx, log_return_idx, test_df
+                            model,
+                            test_loader,
+                            scaler,
+                            device,
+                            len(feature_columns),
+                            close_idx,
+                            log_return_idx,
+                            test_df,
                         )
                         metrics["model"] = model_type
                         evaluation_results.append(metrics)
 
                         predictions, pred_volumes = predict_future_values(
-                            model, df.copy(), future_dates, scaler, args.seq_length, device, feature_columns, log_return_idx
+                            model,
+                            df.copy(),
+                            future_dates,
+                            scaler,
+                            args.seq_length,
+                            device,
+                            feature_columns,
+                            log_return_idx,
                         )
 
                         predictions_list = predictions.flatten().tolist()
                         pred_volumes_list = pred_volumes.flatten().tolist()
 
                         print(f"\n--- 予測詳細 (モデル: {model_type}) ---")
-                        details_df = pd.DataFrame({
-                            'Date': future_dates, 'Prediction': predictions_list, 'Assumed Volume': pred_volumes_list
-                        })
+                        details_df = pd.DataFrame(
+                            {
+                                "Date": future_dates,
+                                "Prediction": predictions_list,
+                                "Assumed Volume": pred_volumes_list,
+                            }
+                        )
                         print(details_df.to_string(index=False))
 
                         chart_binary = plot_prediction_chart(
-                            df, predictions, future_dates, args.stock_code, stock_name, model_type, args.time_frame,
+                            df,
+                            predictions,
+                            future_dates,
+                            args.stock_code,
+                            stock_name,
+                            model_type,
+                            args.time_frame,
                             backtest_data={
-                                "dates": test_df["record_date"].iloc[1:len(backtest_predictions) + 1],
+                                "dates": test_df["record_date"].iloc[
+                                    1 : len(backtest_predictions) + 1
+                                ],
                                 "predictions": backtest_predictions,
                             },
                         )
                         print(f"グラフをメモリ上に生成しました。")
 
-                        chart_id = save_prediction_chart(connection, prediction_batch_id, model_type, chart_binary, updated_by_script)
+                        chart_id = save_prediction_chart(
+                            connection,
+                            prediction_batch_id,
+                            model_type,
+                            chart_binary,
+                            updated_by_script,
+                        )
 
                         if chart_id:
-                            predictions_df = pd.DataFrame({
-                                "date": future_dates, "prediction": predictions.flatten(), "volume": pred_volumes.flatten()
-                            })
-                            save_stock_predictions(
-                                connection, prediction_batch_id, chart_id, model_type, args.stock_code, predictions_df, updated_by_script
+                            predictions_df = pd.DataFrame(
+                                {
+                                    "date": future_dates,
+                                    "prediction": predictions.flatten(),
+                                    "volume": pred_volumes.flatten(),
+                                }
                             )
-                    
+                            save_stock_predictions(
+                                connection,
+                                prediction_batch_id,
+                                chart_id,
+                                model_type,
+                                args.stock_code,
+                                predictions_df,
+                                updated_by_script,
+                            )
+
                     if evaluation_results:
-                        save_run_evaluations(connection, prediction_batch_id, evaluation_results, updated_by_script)
-                    
-                    print("\n--- データベースへの保存処理が正常に完了しました（トランザクションコミット） ---")
+                        save_run_evaluations(
+                            connection,
+                            prediction_batch_id,
+                            evaluation_results,
+                            updated_by_script,
+                        )
+
+                    print(
+                        "\n--- データベースへの保存処理が正常に完了しました（トランザクションコミット） ---"
+                    )
 
                 except Exception as e:
-                    print(f"\n--- トランザクション内でエラーが発生しました。処理をロールバックします。 ---")
+                    print(
+                        "\n--- トランザクション内でエラーが発生しました。処理をロールバックします。 ---"
+                    )
                     traceback.print_exc()
                     transaction.rollback()
                     raise
@@ -252,6 +374,7 @@ def main():
             best_model = results_df["R2 Score"].idxmax()
             print(f"\n最も優れたモデル (R2スコア基準): {best_model}")
             print("---------------------------------")
+
 
 if __name__ == "__main__":
     main()

@@ -7,13 +7,14 @@ from torch import nn
 from torch.utils.data import DataLoader
 from pandas import DatetimeIndex, DataFrame, to_datetime, date_range, DateOffset
 
-from data_processing import add_date_features, add_technical_features
+from data_processing import add_date_features, add_technical_features, add_dow_theory_features
 
 def train_model(
     model: nn.Module,
     train_loader: DataLoader,
     epochs: int,
     device: torch.device,
+    log_interval: int = 10,
 ) -> nn.Module:
     """モデルの学習を実行します。"""
     if device.type == "cuda":
@@ -47,7 +48,7 @@ def train_model(
             grad_scaler.step(optimizer)
             grad_scaler.update()
             total_loss += loss.item()
-        if (i + 1) % 10 == 0:
+        if (i + 1) % log_interval == 0 or (i + 1) == epochs:
             avg_loss = total_loss / len(train_loader)
             print(f"\rEpoch {i+1}/{epochs} completed, Loss: {avg_loss:.4f}", end="")
             sys.stdout.flush()
@@ -118,6 +119,7 @@ def predict_future_values(
         temp_df = pd.concat([current_df, new_row], ignore_index=True)
         temp_df = add_date_features(temp_df)
         temp_df = add_technical_features(temp_df)
+        temp_df = add_dow_theory_features(temp_df)
         
         new_sequence_row = temp_df[feature_columns].iloc[-1].values
         last_sequence = np.vstack([last_sequence[1:], new_sequence_row])

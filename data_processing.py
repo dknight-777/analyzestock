@@ -51,6 +51,15 @@ def calculate_rci(series: pd.Series, period: int = 9) -> pd.Series:
     return series.rolling(window=period).apply(get_rci, raw=False)
 
 
+def calculate_macd(series: pd.Series, short_period: int = 12, long_period: int = 26, signal_period: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    """MACD (Moving Average Convergence Divergence) を計算します。"""
+    short_ema = series.ewm(span=short_period, adjust=False).mean()
+    long_ema = series.ewm(span=long_period, adjust=False).mean()
+    macd_line = short_ema - long_ema
+    signal_line = macd_line.ewm(span=signal_period, adjust=False).mean()
+    macd_histogram = macd_line - signal_line
+    return macd_line, signal_line, macd_histogram
+
 def calculate_bollinger_bands(series: pd.Series, period: int = 20, num_std_dev: int = 2) -> Tuple[pd.Series, pd.Series, pd.Series]:
     """ボリンジャーバンドを計算します。"""
     middle_band = series.rolling(window=period).mean()
@@ -58,6 +67,51 @@ def calculate_bollinger_bands(series: pd.Series, period: int = 20, num_std_dev: 
     upper_band = middle_band + (std_dev * num_std_dev)
     lower_band = middle_band - (std_dev * num_std_dev)
     return upper_band, middle_band, lower_band
+
+
+def add_dow_theory_features(df: pd.DataFrame, order: int = 5) -> pd.DataFrame:
+    """ダウ理論に基づいたトレンド特徴量を追加します。"""
+    
+    highs = df['high']
+    lows = df['low']
+    
+    peak_indices = []
+    for i in range(order, len(highs) - order):
+        if highs.iloc[i] == highs.iloc[i-order:i+order+1].max():
+            peak_indices.append(df.index[i])
+            
+    trough_indices = []
+    for i in range(order, len(lows) - order):
+        if lows.iloc[i] == lows.iloc[i-order:i+order+1].min():
+            trough_indices.append(df.index[i])
+
+    df['dow_trend'] = 0
+    
+    extrema = []
+    for idx in peak_indices:
+        extrema.append((idx, df.loc[idx, 'high'], 'peak'))
+    for idx in trough_indices:
+        extrema.append((idx, df.loc[idx, 'low'], 'trough'))
+        
+    extrema.sort(key=lambda x: x[0])
+    
+    if len(extrema) < 4:
+        return df
+
+    for i in range(len(extrema) - 3):
+        e1, e2, e3, e4 = extrema[i:i+4]
+        
+        # e1: trough, e2: peak, e3: trough, e4: peak
+        if e1[2] == 'trough' and e2[2] == 'peak' and e3[2] == 'trough' and e4[2] == 'peak':
+            if e3[1] > e1[1] and e4[1] > e2[1]: # higher low, higher high
+                df.loc[e1[0]:e4[0], 'dow_trend'] = 1
+                
+        # e1: peak, e2: trough, e3: peak, e4: trough
+        elif e1[2] == 'peak' and e2[2] == 'trough' and e3[2] == 'peak' and e4[2] == 'trough':
+            if e3[1] < e1[1] and e4[1] < e2[1]: # lower high, lower low
+                df.loc[e1[0]:e4[0], 'dow_trend'] = -1
+
+    return df
 
 
 def add_technical_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -75,6 +129,12 @@ def add_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     df['bb_lower'] = bb_lower
     df['bb_width'] = (bb_upper - bb_lower) / bb_middle.replace(0, np.nan)
     df['bb_percent'] = (df['close'] - bb_lower) / (bb_upper - bb_lower).replace(0, np.nan)
+
+    # MACD
+    macd, macd_signal, macd_hist = calculate_macd(df['close'])
+    df['macd'] = macd
+    df['macd_signal'] = macd_signal
+    df['macd_hist'] = macd_hist
 
     df['log_return'] = np.log(df['close']) - np.log(df['close'].shift(1))
     return df
