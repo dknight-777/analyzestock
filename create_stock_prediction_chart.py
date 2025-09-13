@@ -12,7 +12,12 @@ from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import TensorDataset, DataLoader
 
 # Import refactored modules
-from data_processing import create_sequences, add_technical_features, add_date_features, add_dow_theory_features
+from data_processing import (
+    create_sequences,
+    add_technical_features,
+    add_date_features,
+    add_dow_theory_features,
+)
 from db_utils import (
     get_db_engine,
     get_stock_data,
@@ -47,8 +52,8 @@ def main():
         "--model_type",
         type=str,
         choices=["lstm", "nn", "gru"],
-        default=None,
-        help="モデルの種類 (lstm, nn, gru)。指定しない場合は全てのモデルが実行されます。",
+        default="nn",
+        help="モデルの種類 (lstm, nn, gru)。",
     )
     parser.add_argument(
         "--time_frame",
@@ -59,15 +64,27 @@ def main():
     )
     parser.add_argument("--epochs", type=int, default=150, help="学習のエポック数")
     parser.add_argument(
-        "--log_interval", type=int, default=5, help="学習の進捗を表示する間隔"
+        "--log_interval", type=int, default=10, help="学習の進捗を表示する間隔"
     )
     parser.add_argument("--seq_length", type=int, default=30, help="シーケンス長")
     parser.add_argument("--fut_pred", type=int, default=5, help="予測期間（営業日数）")
     parser.add_argument("--batch_size", type=int, default=32, help="バッチサイズ")
     parser.add_argument(
-        "--hidden_layer_size", type=int, default=128, help="隠れ層のサイズ"
+        "--hidden_unit_size",
+        type=int,
+        default=128,
+        help="隠れユニット数 (LSTM, GRU用)",
     )
-    parser.add_argument("--num_layers", type=int, default=2, help="RNN層の数")
+    parser.add_argument(
+        "--num_layers", type=int, default=2, help="RNN層の数 (LSTM, GRU用)"
+    )
+    parser.add_argument(
+        "--nn_layer_units",
+        type=int,
+        nargs="+",
+        default=[4096, 2048, 1024, 512, 128, 64],
+        help="NNモデルの各隠れ層のユニット数をスペース区切りで指定 (例: 100 50)",
+    )
     parser.add_argument(
         "--device",
         type=str,
@@ -76,6 +93,11 @@ def main():
         help="使用するデバイス (cpu or cuda)",
     )
     args = parser.parse_args()
+
+    # --- デバッグ: 引数の値を確認 ---
+    print("\n--- Parsed Arguments ---")
+    print(args)
+    print("------------------------\n")
 
     # --- 0. 準備 ---
     if args.device is None:
@@ -183,7 +205,9 @@ def main():
 
     date_offset = time_frame_options[args.time_frame]["offset"]
     future_dates = pd.date_range(
-        start=df["record_date"].max() + date_offset, periods=args.fut_pred, freq=date_offset
+        start=df["record_date"].max() + date_offset,
+        periods=args.fut_pred,
+        freq=date_offset,
     )
 
     evaluation_results = []
@@ -242,8 +266,9 @@ def main():
                             input_dim=len(feature_columns),
                             seq_length=args.seq_length,
                             output_dim=1,
-                            hidden_layer_size=args.hidden_layer_size,
+                            hidden_unit_size=args.hidden_unit_size,
                             num_layers=args.num_layers,
+                            nn_layer_units=args.nn_layer_units,
                         ).to(device)
 
                         model = train_model(
@@ -269,29 +294,32 @@ def main():
                         metrics["model"] = model_type
                         evaluation_results.append(metrics)
 
-                        predictions, pred_volumes = predict_future_values(
-                            model,
-                            df.copy(),
-                            future_dates,
-                            scaler,
-                            args.seq_length,
-                            device,
-                            feature_columns,
-                            log_return_idx,
-                        )
+                        if args.fut_pred > 0:
+                            predictions, pred_volumes = predict_future_values(
+                                model,
+                                df.copy(),
+                                future_dates,
+                                scaler,
+                                args.seq_length,
+                                device,
+                                feature_columns,
+                                log_return_idx,
+                            )
+                            predictions_list = predictions.flatten().tolist()
+                            pred_volumes_list = pred_volumes.flatten().tolist()
 
-                        predictions_list = predictions.flatten().tolist()
-                        pred_volumes_list = pred_volumes.flatten().tolist()
-
-                        print(f"\n--- 予測詳細 (モデル: {model_type}) ---")
-                        details_df = pd.DataFrame(
-                            {
-                                "Date": future_dates,
-                                "Prediction": predictions_list,
-                                "Assumed Volume": pred_volumes_list,
-                            }
-                        )
-                        print(details_df.to_string(index=False))
+                            print(f"\n--- 予測詳細 (モデル: {model_type}) ---")
+                            details_df = pd.DataFrame(
+                                {
+                                    "Date": future_dates,
+                                    "Prediction": predictions_list,
+                                    "Assumed Volume": pred_volumes_list,
+                                }
+                            )
+                            print(details_df.to_string(index=False))
+                        else:
+                            predictions = np.array([])
+                            pred_volumes = np.array([])
 
                         chart_binary = plot_prediction_chart(
                             df,
@@ -318,7 +346,7 @@ def main():
                             updated_by_script,
                         )
 
-                        if chart_id:
+                        if chart_id and args.fut_pred > 0:
                             predictions_df = pd.DataFrame(
                                 {
                                     "date": future_dates,
@@ -369,6 +397,15 @@ def main():
         print("RMSE (二乗平均平方根誤差): 値が小さいほど良いです。")
         print("MAE (平均絶対誤差): 値が小さいほど良いです。")
         print("R2スコア (決定係数): 値が1に近いほど良いです。")
+        print("【注意】")
+        print("これらの指標は予測と実績の誤差の平均を示すものです。")
+        print(
+            "そのため、スコアが良い場合でも、単に一日遅れで価格を追従しているだけで、"
+        )
+        print("価格の転換点を予測できていない可能性があります。")
+        print(
+            "最終的にはグラフの形状も合わせて、総合的にモデルの良し悪しを判断することが重要です。"
+        )
         print("----------------------")
         if len(results_df) > 1:
             best_model = results_df["R2 Score"].idxmax()
