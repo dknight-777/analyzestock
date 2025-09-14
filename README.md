@@ -170,7 +170,7 @@ R2スコア (決定係数): 値が1に近いほど良いです。
 ----------------------
 
 **生成されたグラフの例:**
-![INTC Stock Prediction Chart](reports/20250914_130856_INTC_nn.png)
+![INTC Stock Prediction Chart](20250914_130856_INTC_nn.png)
 ```
 
 ---
