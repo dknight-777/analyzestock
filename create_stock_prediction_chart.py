@@ -4,12 +4,14 @@ import sys
 import argparse
 import uuid
 import traceback
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
 import torch
 from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import TensorDataset, DataLoader
+import yfinance as yf
 
 # Import refactored modules
 from data_processing import (
@@ -18,21 +20,13 @@ from data_processing import (
     add_date_features,
     add_dow_theory_features,
 )
-from db_utils import (
-    get_db_engine,
-    get_stock_data,
-    save_prediction_run,
-    save_prediction_chart,
-    save_stock_predictions,
-    save_run_evaluations,
-)
 from models import get_model
 from plotting import plot_prediction_chart
 from training import train_model, predict_future_values
 from evaluation import evaluate_model
 
 # --- Program Version ---
-__version__ = "0.7"
+__version__ = "0.9"
 
 # 再現性のためのシード固定
 # --- Seed for reproducibility ---
@@ -82,7 +76,7 @@ def main():
         "--nn_layer_units",
         type=int,
         nargs="+",
-        default=[4096, 2048, 1024, 512, 128, 64],
+        default=[1024, 512, 128, 64],
         help="NNモデルの各隠れ層のユニット数をスペース区切りで指定 (例: 100 50)",
     )
     parser.add_argument(
@@ -91,6 +85,11 @@ def main():
         choices=["cpu", "cuda"],
         default=None,
         help="使用するデバイス (cpu or cuda)",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="デバッグ情報を表示します。",
     )
     args = parser.parse_args()
 
@@ -105,23 +104,134 @@ def main():
     device = torch.device(args.device)
     print(f"Using device: {device}")
 
-    engine = get_db_engine()
-    if not engine:
+    # yfinanceを使用して株価データを取得
+    try:
+        # 予測に必要な期間を自動的に決定
+        # モデルのシーケンス長、テストサイズ、テクニカル指標の最長期間を考慮
+        test_size = 30  # テストデータサイズ
+        min_data_points_for_features = (
+            26  # MACDのlong_periodなど、テクニカル指標に必要な最小データポイント数
+        )
+
+        # 処理後に必要な最小取引日数 = シーケンス長 + テストデータサイズ
+        min_trading_days_after_processing = args.seq_length + test_size
+
+        # dropna()で失われる可能性のある行数を考慮した、必要な最小取引日数
+        # (min_data_points_for_features - 1) は、テクニカル指標計算でNaNになる初期行数
+        min_raw_trading_days_needed = min_trading_days_after_processing + (
+            min_data_points_for_features - 1
+        )
+
+        # 基準となる期間数（例: 日次データ20年分に相当する期間数）
+        # 10年 * 250営業日/年 = 2500期間
+        base_num_periods = 10 * 250
+        if args.time_frame == "daily":
+            base_num_periods = 15 * 250
+        elif args.time_frame == "weekly":
+            base_num_periods = 10 * 250
+        elif args.time_frame == "monthly":
+            base_num_periods = 6 * 250
+
+        # time_frameに応じて必要なカレンダー日数を計算
+        if args.time_frame == "daily":
+            # 日次データの場合、base_num_periodsに安全マージンを追加
+            required_historical_days = (
+                int(base_num_periods * 1.4) + 60
+            )  # 1.4は営業日をカレンダー日に変換する係数
+        elif args.time_frame == "weekly":
+            # 週次データの場合、base_num_periods週分のカレンダー日数を取得
+            required_historical_days = (
+                int(base_num_periods * 7 * 1.2) + 60
+            )  # 1.2は週次データ取得時の安全マージン
+        elif args.time_frame == "monthly":
+            # 月次データの場合、base_num_periodsヶ月分のカレンダー日数を取得
+            required_historical_days = (
+                int(base_num_periods * 30 * 1.1) + 60
+            )  # 1.1は月次データ取得時の安全マージン
+        else:
+            # 未知のtime_frameの場合、デフォルトで20年分の日次データに相当する期間
+            required_historical_days = 20 * 365  # Fallback to 20 calendar years
+
+        # ただし、min_raw_trading_days_neededを満たす最低限の期間は保証する
+        # (これは主に、base_num_periodsが非常に小さい場合に備える)
+        min_required_by_logic = int(min_raw_trading_days_needed * 1.4) + 30
+        if required_historical_days < min_required_by_logic:
+            required_historical_days = min_required_by_logic
+
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=required_historical_days)
+
+        print(
+            f"Downloading stock data for {args.stock_code} from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')} (auto-determined based on model requirements)..."
+        )
+        # yfinanceを使用して株価データを取得
+        yf_interval_map = {
+            "daily": "1d",
+            "weekly": "1wk",
+            "monthly": "1mo",
+        }
+        yf_interval = yf_interval_map.get(
+            args.time_frame, "1d"
+        )  # Default to 1d if not found
+        if args.debug:
+            print(
+                f"DEBUG: yfinance interval set to: {yf_interval} for time_frame: {args.time_frame}"
+            )
+
+        # 日本の証券コードに対応するため、末尾に ".T" を追加
+        # 証券コードが日本のものか判別し、必要に応じて ".T" を追加
+        # 日本の証券コードは通常4桁の数字
+        if args.stock_code.isdigit() and len(args.stock_code) == 4:
+            ticker_code = f"{args.stock_code}.T"
+        else:
+            ticker_code = args.stock_code  # 米国株などの場合はそのまま
+        df = yf.download(
+            ticker_code, start=start_date, end=end_date, interval=yf_interval
+        )
+
+        if df.empty:
+            print(
+                f"銘柄コード {args.stock_code} のデータをyfinanceから取得できませんでした。"
+            )
+            sys.exit(1)
+
+        # yfinanceの列名を既存のコードに合わせる
+        df.reset_index(inplace=True)  # 'Date'インデックスを列に変換
+
+        # yfinanceが返すMultiIndexの列名をフラット化
+        # 例: ('Close', '7203.T') -> 'close'
+        # 例: ('Date', '') -> 'record_date'
+        new_columns = []
+        for col in df.columns:
+            if isinstance(col, tuple):
+                # タプルの場合、最初の要素（メトリック名）を小文字にする
+                metric_name = col[0].lower()
+                if metric_name == "date":
+                    new_columns.append("record_date")
+                else:
+                    new_columns.append(metric_name)
+            else:
+                # タプルでない場合（通常はreset_index後の'Date'列）、小文字にして'record_date'にマッピング
+                if str(col).lower() == "date":
+                    new_columns.append("record_date")
+                else:
+                    new_columns.append(str(col).lower())
+        df.columns = new_columns
+        # print("DEBUG: df.columns after flattening:", df.columns)  # デバッグ出力は削除
+
+        # 銘柄名を取得
+        ticker_info = yf.Ticker(ticker_code).info
+        stock_name = ticker_info.get("longName", args.stock_code)
+        print(f"Successfully downloaded data for: {stock_name}")
+
+    except ImportError:
+        print(
+            "yfinanceがインストールされていません。`pip install yfinance` を実行してください。"
+        )
         sys.exit(1)
-
-    prediction_batch_id = uuid.uuid4()
-    print(f"Prediction Batch ID: {prediction_batch_id}")
-
-    df = get_stock_data(engine, args.stock_code)
-    if df.empty:
-        print(f"銘柄コード {args.stock_code} のデータが見つかりませんでした。")
+    except Exception as e:
+        print(f"yfinanceでのデータ取得中にエラーが発生しました: {e}")
         sys.exit(1)
-
-    stock_name = (
-        df["stock_name"].dropna().iloc[0]
-        if not df["stock_name"].dropna().empty
-        else f"銘柄コード {args.stock_code}"
-    )
 
     # --- 1. 特徴量エンジニアリング ---
     df["record_date"] = pd.to_datetime(df["record_date"])
@@ -133,6 +243,10 @@ def main():
         "monthly": {"freq": "ME", "offset": pd.offsets.MonthEnd()},
     }
     resample_freq = time_frame_options[args.time_frame]["freq"]
+    if args.debug:
+        print(
+            f"DEBUG: Resampling frequency set to: {resample_freq} based on time_frame: {args.time_frame}"
+        )
 
     ohlc_dict = {
         "open": "first",
@@ -144,6 +258,12 @@ def main():
     df = df.resample(resample_freq).agg(ohlc_dict)
     df.reset_index(inplace=True)
     df.dropna(subset=["open", "high", "low", "close", "volume"], inplace=True)
+    if args.debug:
+        print(f"DEBUG: len(df) after resampling and initial dropna: {len(df)}")
+        print("DEBUG: df.head() after resampling:")
+        print(df.head())
+        print("DEBUG: df.tail() after resampling:")
+        print(df.tail())
 
     df = add_technical_features(df)
     df = add_date_features(df)
@@ -186,7 +306,7 @@ def main():
         "dow_trend",
     ]
 
-    test_size = 30
+    test_size = 30  # test_sizeを再定義
     if len(df) <= test_size + args.seq_length:
         print("データが少なく、学習と評価を分割できません。")
         sys.exit(1)
@@ -201,7 +321,7 @@ def main():
     test_scaled = scaler.transform(test_df[feature_columns])
 
     # --- モデル学習・評価・予測ループ ---
-    models_to_run = [args.model_type] if args.model_type else ["lstm", "nn", "gru"]
+    model_type = args.model_type
 
     date_offset = time_frame_options[args.time_frame]["offset"]
     future_dates = pd.date_range(
@@ -211,181 +331,126 @@ def main():
     )
 
     evaluation_results = []
-    updated_by_script = os.path.basename(__file__)
 
     try:
-        with engine.connect() as connection:
-            with connection.begin() as transaction:
-                print(
-                    "\n--- データベースへの保存処理を開始します（トランザクション開始） ---"
-                )
-                try:
-                    save_prediction_run(
-                        connection, prediction_batch_id, args, updated_by_script
-                    )
+        print(f"\n--- Running prediction for model: {model_type} ---")
 
-                    for model_type in models_to_run:
-                        print(f"\n--- Running prediction for model: {model_type} ---")
+        # --- 3. シーケンス作成 ---
+        log_return_idx = feature_columns.index("log_return")
 
-                        # --- 3. シーケンス作成 ---
-                        log_return_idx = feature_columns.index("log_return")
+        X_train, y_train = create_sequences(
+            train_scaled, args.seq_length, log_return_idx
+        )
 
-                        X_train, y_train = create_sequences(
-                            train_scaled, args.seq_length, log_return_idx
-                        )
+        padding_for_test = train_scaled[-args.seq_length :]
+        combined_for_test = np.concatenate([padding_for_test, test_scaled])
+        X_test, y_test = create_sequences(
+            combined_for_test, args.seq_length, log_return_idx
+        )
 
-                        padding_for_test = train_scaled[-args.seq_length :]
-                        combined_for_test = np.concatenate(
-                            [padding_for_test, test_scaled]
-                        )
-                        X_test, y_test = create_sequences(
-                            combined_for_test, args.seq_length, log_return_idx
-                        )
+        X_train_tensor = torch.from_numpy(X_train).float()
+        y_train_tensor = torch.from_numpy(y_train).float()
+        X_test_tensor = torch.from_numpy(X_test).float()
+        y_test_tensor = torch.from_numpy(y_test).float()
 
-                        X_train_tensor = torch.from_numpy(X_train).float()
-                        y_train_tensor = torch.from_numpy(y_train).float()
-                        X_test_tensor = torch.from_numpy(X_test).float()
-                        y_test_tensor = torch.from_numpy(y_test).float()
+        train_data = TensorDataset(X_train_tensor, y_train_tensor)
+        test_data = TensorDataset(X_test_tensor, y_test_tensor)
 
-                        train_data = TensorDataset(X_train_tensor, y_train_tensor)
-                        test_data = TensorDataset(X_test_tensor, y_test_tensor)
+        train_loader = DataLoader(
+            train_data,
+            shuffle=False,
+            batch_size=args.batch_size,
+            drop_last=False,
+        )
+        test_loader = DataLoader(test_data, shuffle=False, batch_size=args.batch_size)
 
-                        train_loader = DataLoader(
-                            train_data,
-                            shuffle=False,
-                            batch_size=args.batch_size,
-                            drop_last=True,
-                        )
-                        test_loader = DataLoader(
-                            test_data, shuffle=False, batch_size=args.batch_size
-                        )
+        # --- 4. モデルの取得と学習 ---
+        model = get_model(
+            model_type=model_type,
+            input_dim=len(feature_columns),
+            seq_length=args.seq_length,
+            output_dim=1,
+            hidden_unit_size=args.hidden_unit_size,
+            num_layers=args.num_layers,
+            nn_layer_units=args.nn_layer_units,
+        ).to(device)
 
-                        # --- 4. モデルの取得と学習 ---
-                        model = get_model(
-                            model_type=model_type,
-                            input_dim=len(feature_columns),
-                            seq_length=args.seq_length,
-                            output_dim=1,
-                            hidden_unit_size=args.hidden_unit_size,
-                            num_layers=args.num_layers,
-                            nn_layer_units=args.nn_layer_units,
-                        ).to(device)
+        model = train_model(
+            model,
+            train_loader,
+            args.epochs,
+            device,
+            log_interval=args.log_interval,
+        )
 
-                        model = train_model(
-                            model,
-                            train_loader,
-                            args.epochs,
-                            device,
-                            log_interval=args.log_interval,
-                        )
+        # --- 5. 評価と予測 ---
+        close_idx = feature_columns.index("close")
+        backtest_predictions, metrics = evaluate_model(
+            model,
+            test_loader,
+            scaler,
+            device,
+            len(feature_columns),
+            close_idx,
+            log_return_idx,
+            test_df,
+        )
+        metrics["model"] = model_type
+        evaluation_results.append(metrics)
 
-                        # --- 5. 評価と予測 ---
-                        close_idx = feature_columns.index("close")
-                        backtest_predictions, metrics = evaluate_model(
-                            model,
-                            test_loader,
-                            scaler,
-                            device,
-                            len(feature_columns),
-                            close_idx,
-                            log_return_idx,
-                            test_df,
-                        )
-                        metrics["model"] = model_type
-                        evaluation_results.append(metrics)
+        if args.fut_pred > 0:
+            predictions, pred_volumes = predict_future_values(
+                model,
+                df.copy(),
+                future_dates,
+                scaler,
+                args.seq_length,
+                device,
+                feature_columns,
+                log_return_idx,
+            )
+            predictions_list = predictions.flatten().tolist()
+            pred_volumes_list = pred_volumes.flatten().tolist()
 
-                        if args.fut_pred > 0:
-                            predictions, pred_volumes = predict_future_values(
-                                model,
-                                df.copy(),
-                                future_dates,
-                                scaler,
-                                args.seq_length,
-                                device,
-                                feature_columns,
-                                log_return_idx,
-                            )
-                            predictions_list = predictions.flatten().tolist()
-                            pred_volumes_list = pred_volumes.flatten().tolist()
+            print(f"\n--- 予測詳細 (モデル: {model_type}) ---")
+            details_df = pd.DataFrame(
+                {
+                    "Date": future_dates,
+                    "Prediction": predictions_list,
+                    "Assumed Volume": pred_volumes_list,
+                }
+            )
+            print(details_df.to_string(index=False))
+        else:
+            predictions = np.array([])
+            pred_volumes = np.array([])
 
-                            print(f"\n--- 予測詳細 (モデル: {model_type}) ---")
-                            details_df = pd.DataFrame(
-                                {
-                                    "Date": future_dates,
-                                    "Prediction": predictions_list,
-                                    "Assumed Volume": pred_volumes_list,
-                                }
-                            )
-                            print(details_df.to_string(index=False))
-                        else:
-                            predictions = np.array([])
-                            pred_volumes = np.array([])
+        chart_binary = plot_prediction_chart(
+            df,
+            predictions,
+            future_dates,
+            args.stock_code,
+            stock_name,
+            model_type,
+            args.time_frame,
+            backtest_data={
+                "dates": test_df["record_date"].iloc[1 : len(backtest_predictions) + 1],
+                "predictions": backtest_predictions,
+            },
+        )
+        print(f"グラフをメモリ上に生成しました。")
 
-                        chart_binary = plot_prediction_chart(
-                            df,
-                            predictions,
-                            future_dates,
-                            args.stock_code,
-                            stock_name,
-                            model_type,
-                            args.time_frame,
-                            backtest_data={
-                                "dates": test_df["record_date"].iloc[
-                                    1 : len(backtest_predictions) + 1
-                                ],
-                                "predictions": backtest_predictions,
-                            },
-                        )
-                        print(f"グラフをメモリ上に生成しました。")
-
-                        chart_id = save_prediction_chart(
-                            connection,
-                            prediction_batch_id,
-                            model_type,
-                            chart_binary,
-                            updated_by_script,
-                        )
-
-                        if chart_id and args.fut_pred > 0:
-                            predictions_df = pd.DataFrame(
-                                {
-                                    "date": future_dates,
-                                    "prediction": predictions.flatten(),
-                                    "volume": pred_volumes.flatten(),
-                                }
-                            )
-                            save_stock_predictions(
-                                connection,
-                                prediction_batch_id,
-                                chart_id,
-                                model_type,
-                                args.stock_code,
-                                predictions_df,
-                                updated_by_script,
-                            )
-
-                    if evaluation_results:
-                        save_run_evaluations(
-                            connection,
-                            prediction_batch_id,
-                            evaluation_results,
-                            updated_by_script,
-                        )
-
-                    print(
-                        "\n--- データベースへの保存処理が正常に完了しました（トランザクションコミット） ---"
-                    )
-
-                except Exception as e:
-                    print(
-                        "\n--- トランザクション内でエラーが発生しました。処理をロールバックします。 ---"
-                    )
-                    traceback.print_exc()
-                    transaction.rollback()
-                    raise
+        # グラフをファイルに保存する
+        report_dir = "reports"
+        os.makedirs(report_dir, exist_ok=True)
+        date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        chart_filename = f"{report_dir}/{date_str}_{args.stock_code}_{model_type}.png"
+        with open(chart_filename, "wb") as f:
+            f.write(chart_binary)
+        print(f"グラフを {chart_filename} に保存しました。")
 
     except Exception as e:
-        print(f"\n--- データベース接続またはトランザクション開始に失敗しました。 ---")
+        print(f"\n--- 処理中にエラーが発生しました。 ---")
         traceback.print_exc()
 
     # --- 6. 最終評価結果の表示 ---
@@ -407,10 +472,6 @@ def main():
             "最終的にはグラフの形状も合わせて、総合的にモデルの良し悪しを判断することが重要です。"
         )
         print("----------------------")
-        if len(results_df) > 1:
-            best_model = results_df["R2 Score"].idxmax()
-            print(f"\n最も優れたモデル (R2スコア基準): {best_model}")
-            print("---------------------------------")
 
 
 if __name__ == "__main__":
