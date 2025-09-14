@@ -8,7 +8,7 @@
 
 - 複数の機械学習モデル（LSTM, GRU, NN）による株価予測
 - 過去のデータと将来の予測値を結合したチャートを生成
-- 証券コード、モデル、時間枠（日足/週足）などをコマンドライン引数で指定可能
+- 証券コード、モデル、時間枠（日足/週足/月足）などをコマンドライン引数で指定可能
 
 ---
 
@@ -116,23 +116,29 @@ python3 create_stock_prediction_chart.py [オプション]
 
 **主なオプション:** 
 
-| オプション | 説明 | デフォルト値 | 例 |
-| :--- | :--- | :--- | :--- |
-| `--stock_code` | 予測対象の証券コード | `9432` | `--stock_code 9432` |
-| `--model_type` | `lstm`, `nn`, `gru` からモデルを選択。指定しない場合は3つ全て実行。 | `None` | `--model_type lstm` |
-| `--time_frame` | `daily` (日足) または `weekly` (週足) を選択。 | `daily` | `--time_frame weekly` |
-| `--epochs` | 学習のエポック数。 | `150` | `--epochs 200` |
-| `--seq_length` | 予測に用いる過去データのシーケンス長。 | `30` | `--seq_length 60` |
-| `--fut_pred` | 何営業日先まで予測するか。 | `5` | `--fut_pred 10` |
-| `--device` | `cpu` または `cuda` を指定。 | 自動検出 | `--device cpu` |
+| オプション | 説明 | デフォルト値 |
+| :--- | :--- | :--- |
+| `--stock_code` | 予測対象の証券コード。 | `9432` |
+| `--model_type` | `lstm`, `nn`, `gru` からモデルを選択。 | `nn` |
+| `--time_frame` | `daily` (日足), `weekly` (週足), `monthly` (月足) を選択。 | `daily` |
+| `--epochs` | 学習のエポック数。 | `150` |
+| `--seq_length` | 予測に用いる過去データのシーケンス長。 | `30` |
+| `--fut_pred` | 何営業日先まで予測するか。 | `5` |
+| `--hidden_unit_size` | 隠れユニット数 (LSTM, GRU用)。 | `128` |
+| `--num_layers` | RNN層の数 (LSTM, GRU用)。 | `2` |
+| `--nn_layer_units` | NNモデルの各隠れ層のユニット数をスペース区切りで指定。 | `100 50` |
+| `--device` | `cpu` または `cuda` を指定。 | 自動検出 |
 
 **実行例:** 
 ```bash
-# 銘柄コード9432をLSTMモデルで予測
-python3 create_stock_prediction_chart.py --stock_code 9432 --model_type lstm
-
-# 全てのモデルで予測を実行
+# 銘柄コード9432をデフォルトのNNモデルで予測
 python3 create_stock_prediction_chart.py --stock_code 9432
+
+# LSTMモデルで予測を実行
+python3 create_stock_prediction_chart.py --model_type lstm
+
+# NNモデルの隠れ層を256, 128ユニットで実行
+python3 create_stock_prediction_chart.py --model_type nn --nn_layer_units 256 128
 ```
 
 ### 予測レポートの生成 (generate_report.py)
