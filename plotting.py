@@ -29,12 +29,15 @@ def plot_prediction_chart(
     plt.figure(figsize=(12, 7))
 
     # 表示する過去のデータ範囲を決定
-    plot_range_days = 30
-    if backtest_data:
-        plot_range_days = max(plot_range_days, len(backtest_data["dates"]) + 5)
+    if time_frame == 'weekly':
+        start_date_offset = pd.DateOffset(months=5)
+    elif time_frame == 'monthly':
+        start_date_offset = pd.DateOffset(years=2)
+    else: # daily
+        start_date_offset = pd.DateOffset(months=1)
 
     last_date = df["record_date"].max()
-    start_date = last_date - pd.DateOffset(days=plot_range_days)
+    start_date = last_date - start_date_offset
     plot_df = df[df["record_date"] >= start_date].copy()
 
     # Combine all dates for x-axis labeling
@@ -42,6 +45,13 @@ def plot_prediction_chart(
 
     # Plot actual stock price using numerical index
     plt.plot(range(len(plot_df)), plot_df["close"], label="実際の株価", color="blue")
+
+    # Plot Bollinger Bands if they exist
+    if all(col in plot_df.columns for col in ['bb_upper', 'bb_middle', 'bb_lower']):
+        # Plot the middle band
+        plt.plot(range(len(plot_df)), plot_df['bb_middle'], linestyle='--', color='gray', alpha=0.7, label='ボリンジャーバンド (中央)')
+        # Shade the area between the upper and lower bands
+        plt.fill_between(range(len(plot_df)), plot_df['bb_lower'], plot_df['bb_upper'], color='gray', alpha=0.2, label='ボリンジャーバンド (±2σ)')
 
     # Plot future predictions using numerical index, offset by length of actual data
     # Prepend the last actual close value to predictions to create a continuous line
@@ -62,7 +72,8 @@ def plot_prediction_chart(
     # Set x-axis ticks and labels to show actual dates
     tick_indices = np.linspace(0, len(all_dates) - 1, 10, dtype=int)
     tick_labels = [all_dates.iloc[i].strftime("%Y-%m-%d") for i in tick_indices]
-    plt.xticks(tick_indices, tick_labels, rotation=45, ha="right")
+    plt.xticks(tick_indices, tick_labels, rotation=45, ha="right", color="black")
+    plt.yticks(color="black")
 
     # 最高値・最安値の注釈
     # Create a list of DataFrames, each with 'numerical_index', 'record_date', 'close'
@@ -71,7 +82,7 @@ def plot_prediction_chart(
     # Actual data
     actual_annotation_df = plot_df[["record_date", "close"]].copy()
     actual_annotation_df["numerical_index"] = range(len(plot_df))
-    annotation_dfs.append((actual_annotation_df, "blue"))
+    annotation_dfs.append((actual_annotation_df, "black"))
 
     # Predicted data
     if predictions.size > 0:
@@ -82,7 +93,7 @@ def plot_prediction_chart(
         predicted_annotation_df["numerical_index"] = range(len(plot_df), len(plot_df) + len(predictions))
         # Ensure 'close' column contains scalar Python floats
         predicted_annotation_df["close"] = predicted_annotation_df["close"].astype(float)
-        annotation_dfs.append((predicted_annotation_df, "orange"))
+        annotation_dfs.append((predicted_annotation_df, "black"))
 
     for data_frame, color in annotation_dfs:
         if not data_frame.empty:
@@ -101,10 +112,13 @@ def plot_prediction_chart(
     plt.title(
         f"{stock_name} ({stock_code}) の株価予測 ({model_type.upper()}・{time_frame_japanese})",
         fontsize=16,
+        color="black",
     )
-    plt.xlabel("日付", fontsize=12)
-    plt.ylabel("終値", fontsize=12)
-    plt.legend()
+    plt.xlabel("日付", fontsize=12, color="black")
+    plt.ylabel("終値", fontsize=12, color="black")
+    legend = plt.legend()
+    for text in legend.get_texts():
+        text.set_color("black")
     plt.grid(True, linestyle="--", alpha=0.6)
     plt.tight_layout()
     # 旧X軸フォーマット設定 (ユーザーの要望により削除)

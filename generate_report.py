@@ -10,7 +10,6 @@ from sqlalchemy import text, Engine, Connection
 
 # Import from existing modules
 from db_utils import get_db_engine
-from create_stock_prediction_chart import __version__
 
 # PDF出力用のライブラリ
 REPORTLAB_AVAILABLE = False
@@ -34,7 +33,6 @@ try:
 
     REPORTLAB_AVAILABLE = True
 except ImportError as e:
-    # エラーを捕捉するが、表示はPDF生成が要求された場合のみ行う
     _reportlab_import_error = e
 
 
@@ -48,8 +46,7 @@ def register_japanese_font():
         print(
             f"警告: 日本語フォント '{font_path}' が見つかりません。PDFの日本語が文字化けする可能性があります。"
         )
-        return "Helvetica"  # デフォルトフォント
-
+        return "Helvetica"
 
 def get_latest_prediction_batch_id(engine: Engine) -> UUID | None:
     """データベースから最新の prediction_batch_id を取得します。"""
@@ -74,7 +71,6 @@ def get_stock_name(connection: Connection, stock_code: str) -> str | None:
     result = connection.execute(query, {"stock_code": stock_code}).scalar_one_or_none()
     return result
 
-
 def get_prediction_run_info(connection: Connection, batch_id: UUID) -> pd.Series | None:
     """指定されたバッチIDの実行情報を取得します。"""
     query = text("SELECT * FROM prediction_runs WHERE prediction_batch_id = :batch_id")
@@ -93,7 +89,7 @@ def get_evaluation_metrics(connection: Connection, batch_id: UUID) -> pd.DataFra
 def get_predictions(connection: Connection, batch_id: UUID) -> pd.DataFrame:
     """指定されたバッチIDの予測結果を取得します。"""
     query = text(
-        """SELECT model_name, prediction_target_date, predicted_value, predicted_volume, actual_value FROM stock_predictions WHERE prediction_batch_id = :batch_id ORDER BY model_name, prediction_target_date"""
+        """SELECT model_name, prediction_target_date, predicted_value, predicted_volume FROM stock_predictions WHERE prediction_batch_id = :batch_id ORDER BY model_name, prediction_target_date"""
     )
     return pd.read_sql_query(query, connection, params={"batch_id": str(batch_id)})
 
@@ -147,19 +143,18 @@ def generate_text_report(
 
     if not predictions.empty:
         print("\n■ 予測結果詳細:")
-        
-        # Create a multi-index pivot table
         pivot_df = predictions.pivot_table(
             index='prediction_target_date',
             columns='model_name',
             values=['predicted_value', 'predicted_volume']
         )
-        
-        # Format the output
-        if 'predicted_value' in pivot_df.columns:
-            pivot_df['predicted_value'] = pivot_df['predicted_value'].round(2)
-        if 'predicted_volume' in pivot_df.columns:
-            pivot_df['predicted_volume'] = pivot_df['predicted_volume'].fillna(0).astype(int)
+        pivot_df = pivot_df.swaplevel(0, 1, axis=1)
+        pivot_df.sort_index(axis=1, inplace=True)
+
+        # Round values
+        for model in pivot_df.columns.levels[0]:
+            pivot_df[(model, 'predicted_value')] = pivot_df[(model, 'predicted_value')].round(2)
+            pivot_df[(model, 'predicted_volume')] = pivot_df[(model, 'predicted_volume')].astype(int)
 
         pivot_df.index = pd.to_datetime(pivot_df.index).strftime('%Y-%m-%d')
         print(pivot_df.to_string())
@@ -201,36 +196,15 @@ def generate_pdf_report(
     doc = SimpleDocTemplate(str(pdf_file), pagesize=A4)
     styles = getSampleStyleSheet()
 
-    # 日本語フォントの設定
     font_name = register_japanese_font()
-    styles.add(
-        ParagraphStyle(name="Japan", fontName=font_name, fontSize=10, leading=14)
-    )
-    styles.add(
-        ParagraphStyle(
-            name="JapanTitle",
-            fontName=font_name,
-            fontSize=18,
-            alignment=TA_CENTER,
-            spaceAfter=18,
-        )
-    )
-    styles.add(
-        ParagraphStyle(
-            name="JapanH2",
-            fontName=font_name,
-            fontSize=14,
-            spaceBefore=12,
-            spaceAfter=6,
-        )
-    )
+    styles.add(ParagraphStyle(name="Japan", fontName=font_name, fontSize=10, leading=14))
+    styles.add(ParagraphStyle(name="JapanTitle", fontName=font_name, fontSize=18, alignment=TA_CENTER, spaceAfter=18))
+    styles.add(ParagraphStyle(name="JapanH2", fontName=font_name, fontSize=14, spaceBefore=12, spaceAfter=6))
 
     story = []
 
-    # 1. タイトル
     story.append(Paragraph("株価予測レポート", styles["JapanTitle"]))
 
-    # 2. 実行情報
     story.append(Paragraph("実行情報", styles["JapanH2"]))
     stock_code_display = run_info['stock_code']
     if stock_name:
@@ -244,39 +218,27 @@ def generate_pdf_report(
         ["使用モデル:", run_info["model_type"] or "全モデル"],
     ]
     info_table = Table(info_data, colWidths=[100, 350])
-    info_table.setStyle(
-        TableStyle(
-            [
-                ("FONT", (0, 0), (-1, -1), font_name, 10),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                ("BACKGROUND", (0, 0), (0, -1), colors.lightgrey),
-            ]
-        )
-    )
+    info_table.setStyle(TableStyle([
+        ("FONT", (0, 0), (-1, -1), font_name, 10),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("BACKGROUND", (0, 0), (0, -1), colors.lightgrey),
+    ]))
     story.append(info_table)
     story.append(Spacer(1, 12))
 
-    # 3. モデル評価指標
     if not eval_metrics.empty:
         story.append(Paragraph("モデル評価指標", styles["JapanH2"]))
-        eval_data = [eval_metrics.columns.tolist()] + eval_metrics.round(
-            4
-        ).values.tolist()
+        eval_data = [eval_metrics.columns.tolist()] + eval_metrics.round(4).values.tolist()
         eval_table = Table(eval_data, hAlign="LEFT")
-        eval_table.setStyle(
-            TableStyle(
-                [
-                    ("FONT", (0, 0), (-1, -1), font_name, 10),
-                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-                    ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
-                ]
-            )
-        )
+        eval_table.setStyle(TableStyle([
+            ("FONT", (0, 0), (-1, -1), font_name, 10),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+            ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
+        ]))
         story.append(eval_table)
         story.append(Spacer(1, 12))
 
-        # 指標の説明
         story.append(Paragraph("指標の説明", styles["JapanH2"]))
         explanation_texts = [
             "<b>RMSE (二乗平均平方根誤差):</b> 予測と実際の値の差の二乗の平均の平方根。小さいほど良い。",
@@ -285,69 +247,58 @@ def generate_pdf_report(
         ]
         for text in explanation_texts:
             story.append(Paragraph(text, styles["Japan"]))
-        
         story.append(Spacer(1, 12))
 
-        # 最も精度の良いモデル
         best_model = eval_metrics.loc[eval_metrics['r2_score'].idxmax()]
         best_model_text = f"<b>最も精度の良いモデル:</b> R2 Scoreが最も高いモデルは <b>{best_model['model_name']}</b> (R2: {best_model['r2_score']:.4f}) です。"
         story.append(Paragraph(best_model_text, styles["Japan"]))
         story.append(Spacer(1, 12))
 
-    # 4. 予測結果詳細 (Pivot Table)
     if not predictions.empty:
         story.append(Paragraph("予測結果詳細", styles["JapanH2"]))
-        
-        # --- 予測価格と出来高の統合テーブル ---
         pivot_df = predictions.pivot_table(
             index='prediction_target_date',
             columns='model_name',
             values=['predicted_value', 'predicted_volume']
         )
+        pivot_df = pivot_df.swaplevel(0, 1, axis=1)
+        pivot_df.sort_index(axis=1, inplace=True)
 
-        # カラムの順序を調整 (value -> volume)
-        pivot_df = pivot_df.reorder_levels([1, 0], axis=1).sort_index(axis=1)
-        
-        # フォーマット
+        # Round values
         for model in pivot_df.columns.levels[0]:
             pivot_df[(model, 'predicted_value')] = pivot_df[(model, 'predicted_value')].round(2)
-            pivot_df[(model, 'predicted_volume')] = pivot_df[(model, 'predicted_volume')].fillna(0).astype(int)
+            pivot_df[(model, 'predicted_volume')] = pivot_df[(model, 'predicted_volume')].astype(int)
 
-        # ReportLabのテーブルデータを作成
         pivot_df.index = pd.to_datetime(pivot_df.index).strftime('%Y-%m-%d')
-        header1 = ["Date"] + [col[0] for col in pivot_df.columns]
-        header2 = [""] + [col[1].replace('predicted_', '').capitalize() for col in pivot_df.columns]
-        
-        # ユニークなモデル名を取得し、ヘッダー1をマージ
-        unique_models = sorted(list(set(h for h in header1 if h != "Date")))
-        spans = []
-        for model in unique_models:
-            start = header1.index(model)
-            end = len(header1) - 1 - header1[::-1].index(model)
-            if start != end:
-                spans.append(('SPAN', (start, 0), (end, 0)))
 
+        # Prepare data for ReportLab Table
+        header1 = [""] + [model for model in pivot_df.columns.levels[0] for _ in range(2)]
+        header2 = ["Date"] + [col[1].replace("predicted_", "") for col in pivot_df.columns]
+        
         data = [header1, header2] + [
             [idx] + list(row) for idx, row in zip(pivot_df.index, pivot_df.values)
         ]
-        
+
         pred_table = Table(data, hAlign="LEFT")
-        pred_table.setStyle(
-            TableStyle(
-                [
-                    ("FONT", (0, 0), (-1, -1), font_name, 10),
-                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                    ("BACKGROUND", (0, 0), (-1, 1), colors.lightgrey),
-                    ("BACKGROUND", (0, 2), (0, -1), colors.lightgrey),
-                    ("ALIGN", (0, 0), (-1, 1), "CENTER"),
-                    ("ALIGN", (1, 2), (-1, -1), "RIGHT"),
-                ] + spans
-            )
-        )
+        style = [
+            ("FONT", (0, 0), (-1, -1), font_name, 10),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("BACKGROUND", (0, 0), (-1, 1), colors.lightgrey),
+            ("BACKGROUND", (0, 2), (0, -1), colors.lightgrey),
+            ("ALIGN", (1, 0), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ]
+
+        # Add SPAN commands for the first header row
+        for i, model in enumerate(pivot_df.columns.levels[0]):
+            start = i * 2 + 1
+            end = start + 1
+            style.append(("SPAN", (start, 0), (end, 0)))
+        
+        pred_table.setStyle(TableStyle(style))
         story.append(pred_table)
         story.append(Spacer(1, 12))
 
-    # 5. グラフ
     if charts:
         story.append(PageBreak())
         story.append(Paragraph("予測グラフ", styles["JapanH2"]))
@@ -363,41 +314,18 @@ def generate_pdf_report(
 
 def main():
     """レポート生成のメイン処理"""
-    parser = argparse.ArgumentParser(
-        description="データベースから予測結果のレポートを生成します。"
-    )
-    parser.add_argument(
-        "--batch_id",
-        type=str,
-        help="レポート対象の prediction_batch_id。指定しない場合は最新のものが使われます。",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="reports",
-        help="レポートとグラフの出力先ディレクトリ。",
-    )
-    parser.add_argument(
-        "--format",
-        type=str,
-        choices=["text", "pdf"],
-        default="pdf",
-        help="出力形式 (text または pdf)。",
-    )
+    parser = argparse.ArgumentParser(description="データベースから予測結果のレポートを生成します。")
+    parser.add_argument("--batch_id", type=str, help="レポート対象の prediction_batch_id。指定しない場合は最新のものが使われます。")
+    parser.add_argument("--output_dir", type=str, default="reports", help="レポートとグラフの出力先ディレクトリ。")
+    parser.add_argument("--format", type=str, choices=["text", "pdf"], default="pdf", help="出力形式 (text または pdf)。")
     args = parser.parse_args()
 
     if args.format == "pdf" and not REPORTLAB_AVAILABLE:
         print("エラー: PDF出力には reportlab ライブラリが必要です。", file=sys.stderr)
-        print(
-            "以下のコマンドを実行して、必要なライブラリをインストールしてください:",
-            file=sys.stderr,
-        )
+        print("以下のコマンドを実行して、必要なライブラリをインストールしてください:", file=sys.stderr)
         print("pip install -r requirements.txt", file=sys.stderr)
         if _reportlab_import_error:
-            print(
-                "\n[デバッグ情報] インポート時に以下のエラーが発生しました:",
-                file=sys.stderr,
-            )
+            print("\n[デバッグ情報] インポート時に以下のエラーが発生しました:", file=sys.stderr)
             print(f"  {_reportlab_import_error}", file=sys.stderr)
         sys.exit(1)
 
@@ -424,25 +352,18 @@ def main():
     with engine.connect() as connection:
         run_info = get_prediction_run_info(connection, batch_id)
         if run_info is None:
-            print(
-                f"エラー: 指定されたbatch_id ({batch_id}) の実行情報が見つかりません。"
-            )
+            print(f"エラー: 指定されたbatch_id ({batch_id}) の実行情報が見つかりません。")
             sys.exit(1)
 
         stock_name = get_stock_name(connection, run_info['stock_code'])
-
         eval_metrics = get_evaluation_metrics(connection, batch_id)
         predictions = get_predictions(connection, batch_id)
         charts = get_charts(connection, batch_id)
 
     if args.format == "pdf":
-        generate_pdf_report(
-            run_info, eval_metrics, predictions, charts, args.output_dir, batch_id, stock_name
-        )
+        generate_pdf_report(run_info, eval_metrics, predictions, charts, args.output_dir, batch_id, stock_name)
     else:
-        generate_text_report(
-            run_info, eval_metrics, predictions, charts, args.output_dir, batch_id, stock_name
-        )
+        generate_text_report(run_info, eval_metrics, predictions, charts, args.output_dir, batch_id, stock_name)
 
 
 if __name__ == "__main__":

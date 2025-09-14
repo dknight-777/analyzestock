@@ -7,16 +7,16 @@ from torch import nn
 from torch.utils.data import DataLoader
 from pandas import DatetimeIndex, DataFrame, to_datetime, date_range, DateOffset
 
-from data_processing import add_date_features, add_technical_features
+from data_processing import add_date_features, add_technical_features, add_dow_theory_features
 
 def train_model(
     model: nn.Module,
     train_loader: DataLoader,
     epochs: int,
     device: torch.device,
+    log_interval: int = 10,
 ) -> nn.Module:
     """モデルの学習を実行します。"""
-    # PyTorch 2.0+ で利用可能なモデルのコンパイル
     if device.type == "cuda":
         major, _ = torch.cuda.get_device_capability()
         if major >= 7:
@@ -26,12 +26,10 @@ def train_model(
             except Exception as e:
                 print(f"Failed to compile model, proceeding without compilation: {e}")
         else:
-            print(
-                f"GPU compute capability ({major}.x) is less than 7.0. Skipping torch.compile()."
-            )
+            print(f"GPU compute capability ({major}.x) is less than 7.0. Skipping torch.compile().")
 
     loss_function = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
     grad_scaler = torch.amp.GradScaler(enabled=(device.type == "cuda"))
 
     print("モデルの学習を開始します...")
@@ -39,31 +37,23 @@ def train_model(
     for i in range(epochs):
         total_loss = 0
         for seq, labels in train_loader:
-            seq, labels = seq.to(device, non_blocking=True), labels.to(
-                device, non_blocking=True
-            )
-
+            seq, labels = seq.to(device, non_blocking=True), labels.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-
-            with torch.amp.autocast(
-                device_type=device.type, enabled=(device.type == "cuda")
-            ):
+            with torch.amp.autocast(device_type=device.type, enabled=(device.type == "cuda")):
                 y_pred = model(seq)
                 loss = loss_function(y_pred, labels)
-
             grad_scaler.scale(loss).backward()
+            grad_scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             grad_scaler.step(optimizer)
             grad_scaler.update()
-
             total_loss += loss.item()
-
-        if (i + 1) % 10 == 0:
+        if (i + 1) % log_interval == 0 or (i + 1) == epochs:
             avg_loss = total_loss / len(train_loader)
             print(f"\rEpoch {i+1}/{epochs} completed, Loss: {avg_loss:.4f}", end="")
             sys.stdout.flush()
     print("\nモデルの学習が完了しました。")
     return model
-
 
 def predict_future_values(
     model: nn.Module,
@@ -73,88 +63,73 @@ def predict_future_values(
     seq_length: int,
     device: torch.device,
     feature_columns: list,
+    log_return_idx: int
 ) -> tuple[np.ndarray, np.ndarray]:
-    """学習済みモデルを使用して将来の値を予測します。特徴量を動的に再計算します。"""
+    """学習済みモデルを使用して将来の値を予測します。対数リターンを予測し、価格に変換します。"""
     model.eval()
 
-    close_col_idx = feature_columns.index("close")
-    volume_col_index = feature_columns.index("volume")
-
+    last_sequence = historical_df[feature_columns].values[-seq_length:]
+    
+    future_predictions = []
+    
     open_offset = (historical_df['open'] - historical_df['close']).mean()
     high_offset = (historical_df['high'] - historical_df['close']).mean()
     low_offset = (historical_df['low'] - historical_df['close']).mean()
-
-    predictions_df = historical_df.copy()
+    
+    current_df = historical_df.copy()
 
     for date in future_dates:
-        last_sequence = predictions_df[feature_columns].tail(seq_length)
-        last_sequence_scaled = scaler.transform(last_sequence)
-        
-        seq = torch.from_numpy(last_sequence_scaled).float().unsqueeze(0).to(device)
+        # DataFrameに変換して警告を抑制
+        last_sequence_df = pd.DataFrame(last_sequence, columns=feature_columns)
+        last_sequence_scaled = scaler.transform(last_sequence_df)
+        seq_tensor = torch.from_numpy(last_sequence_scaled).float().unsqueeze(0).to(device)
 
         with torch.no_grad():
-            prediction_normalized = model(seq)[0].cpu().numpy()
-            prediction_normalized = np.clip(prediction_normalized, 0, 1)
+            predicted_scaled_log_return = model(seq_tensor)[0].cpu().numpy()
 
-            dummy_array = np.zeros((1, len(feature_columns)))
-            dummy_array[0, close_col_idx] = prediction_normalized[0]
-            dummy_array[0, volume_col_index] = prediction_normalized[1]
-            inversed_pred = scaler.inverse_transform(dummy_array)
-            predicted_close = inversed_pred[0, close_col_idx]
+        dummy_array = np.zeros((1, len(feature_columns)))
+        dummy_array[0, log_return_idx] = predicted_scaled_log_return
+        unscaled_log_return = scaler.inverse_transform(dummy_array)[0, log_return_idx]
 
-            # --- ユーザー提供のロジックで出来高を決定 ---
-            price_change_threshold = 0.005 # 0.5%の変動を「横ばい」の閾値とする
-            last_close = predictions_df['close'].iloc[-1]
-            price_change_ratio = (predicted_close - last_close) / last_close
+        last_close_price = last_sequence[-1, feature_columns.index('close')]
+        predicted_close = last_close_price * np.exp(unscaled_log_return)
 
-            if abs(price_change_ratio) < price_change_threshold:
-                # 横ばいの場合: 5営業日前の出来高を使用
-                if len(predictions_df) >= 5:
-                    predicted_volume = predictions_df['volume'].iloc[-5]
-                else:
-                    # データが5日未満の場合は利用可能な最も古いデータを使用
-                    predicted_volume = predictions_df['volume'].iloc[0]
+        price_change_threshold = 0.005
+        price_change_ratio = (predicted_close - last_close_price) / last_close_price
+        if abs(price_change_ratio) < price_change_threshold:
+            predicted_volume = current_df['volume'].iloc[-5] if len(current_df) >= 5 else current_df['volume'].iloc[0]
+        else:
+            price_range_margin = 0.01
+            price_min, price_max = predicted_close * (1 - price_range_margin), predicted_close * (1 + price_range_margin)
+            similar_days = historical_df[(historical_df['close'] >= price_min) & (historical_df['close'] <= price_max)]
+            if not similar_days.empty:
+                predicted_volume = similar_days['volume'].mean()
             else:
-                # トレンドがある場合: 過去の同じ価格帯の出来高の平均を使用
-                price_range_margin = 0.01 # 1%の価格帯マージン
-                price_min = predicted_close * (1 - price_range_margin)
-                price_max = predicted_close * (1 + price_range_margin)
-                
-                similar_days = historical_df[
-                    (historical_df['close'] >= price_min) & (historical_df['close'] <= price_max)
-                ]
-                
-                if not similar_days.empty:
-                    predicted_volume = similar_days['volume'].mean()
-                else:
-                    # 該当する過去データがない場合は5営業日前の出来高を使用
-                    if len(predictions_df) >= 5:
-                        predicted_volume = predictions_df['volume'].iloc[-5]
-                    else:
-                        predicted_volume = predictions_df['volume'].iloc[0]
-            
-            # --- 新しい行を作成 ---
-            new_row_data = {
-                'record_date': date,
-                'close': predicted_close,
-                'volume': predicted_volume,
-                'open': predicted_close + open_offset,
-                'high': max(predicted_close, predicted_close + high_offset),
-                'low': min(predicted_close, predicted_close + low_offset),
-            }
-            new_row_df = pd.DataFrame([new_row_data])
-            
-            predictions_df = pd.concat([predictions_df, new_row_df], ignore_index=True)
-            
-            predictions_df = add_date_features(predictions_df)
-            predictions_df = add_technical_features(predictions_df)
-            
-            predictions_df[feature_columns] = predictions_df[feature_columns].ffill()
-            predictions_df[feature_columns] = predictions_df[feature_columns].bfill()
+                predicted_volume = current_df['volume'].iloc[-5] if len(current_df) >= 5 else current_df['volume'].iloc[0]
 
-    future_predictions = predictions_df[predictions_df['record_date'].isin(future_dates)]
-    predicted_prices = future_predictions['close'].values
-    predicted_volumes = future_predictions['volume'].values
+        new_row = pd.DataFrame([{
+            'record_date': date,
+            'close': predicted_close,
+            'volume': predicted_volume,
+            'open': predicted_close + open_offset,
+            'high': max(predicted_close, predicted_close + high_offset),
+            'low': min(predicted_close, predicted_close + low_offset),
+        }])
+        
+        temp_df = pd.concat([current_df, new_row], ignore_index=True)
+        temp_df = add_date_features(temp_df)
+        temp_df = add_technical_features(temp_df)
+        temp_df = add_dow_theory_features(temp_df)
+        
+        new_sequence_row = temp_df[feature_columns].iloc[-1].values
+        last_sequence = np.vstack([last_sequence[1:], new_sequence_row])
+        
+        future_predictions.append(new_row.iloc[0])
+        current_df = temp_df
+
+    predictions_df = pd.DataFrame(future_predictions)
+    predicted_prices = predictions_df['close'].values
+    predicted_volumes = predictions_df['volume'].values
 
     return np.maximum(0, predicted_prices), np.maximum(0, predicted_volumes)
 
