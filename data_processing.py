@@ -1,7 +1,9 @@
 import numpy as np
 import pandas as pd
 from typing import Tuple
-
+import os
+import glob
+from datetime import datetime
 
 def create_sequences(
     data: np.ndarray, seq_length: int, target_idx: int
@@ -166,3 +168,85 @@ def add_date_features(df: pd.DataFrame) -> pd.DataFrame:
         df[f"{col}_sin"] = np.sin(2 * np.pi * df[col] / max_val)
         df[f"{col}_cos"] = np.cos(2 * np.pi * df[col] / max_val)
     return df
+
+def save_data_to_csv(df: pd.DataFrame, ticker_code: str, data_dir: str = "data") -> str:
+    """DataFrameをタイムスタンプ付きのCSVファイルに保存します。"""
+    os.makedirs(data_dir, exist_ok=True)
+    date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # ticker_code may contain characters that are not suitable for file names, so we sanitize it.
+    sanitized_ticker = "".join(c for c in ticker_code if c.isalnum())
+    file_path = os.path.join(data_dir, f"{date_str}_{sanitized_ticker}.csv")
+    df.to_csv(file_path, index=False)
+    print(f"Data saved to {file_path}")
+    return file_path
+
+def load_latest_data_from_csv(ticker_code: str, data_dir: str = "data") -> Tuple[pd.DataFrame | None, str | None]:
+    """指定されたticker_codeの最新のCSVファイルを読み込み、DataFrameとファイルパスを返します。"""
+    sanitized_ticker = "".join(c for c in ticker_code if c.isalnum())
+    search_pattern = os.path.join(data_dir, f"*_{sanitized_ticker}.csv")
+    file_list = glob.glob(search_pattern)
+    if not file_list:
+        return None, None
+    
+    latest_file = max(file_list, key=os.path.getctime)
+    print(f"Loading data from {latest_file}")
+    df = pd.read_csv(latest_file)
+    # record_dateをdatetime型に変換
+    if 'record_date' in df.columns:
+        df['record_date'] = pd.to_datetime(df['record_date'])
+    return df, latest_file
+
+
+if __name__ == "__main__":
+    # --- テスト用のデータフレームを作成 ---
+    dates = pd.to_datetime(pd.date_range(start="2023-01-01", periods=100, freq="D"))
+    data = {
+        "record_date": dates,
+        "open": np.random.uniform(95, 105, 100),
+        "high": np.random.uniform(100, 110, 100),
+        "low": np.random.uniform(90, 100, 100),
+        "close": np.random.uniform(98, 108, 100),
+        "volume": np.random.randint(10000, 50000, 100),
+    }
+    test_df = pd.DataFrame(data)
+
+    # --- 各関数のテスト ---
+    print("--- Testing add_technical_features ---")
+    tech_df = add_technical_features(test_df.copy().set_index("record_date"))
+    print(tech_df.head())
+    print(tech_df.tail())
+    print("\n--- Testing add_date_features ---")
+    date_df = add_date_features(test_df.copy())
+    print(date_df.head())
+    print(date_df.tail())
+
+    # --- create_sequencesのテスト ---
+    print("\n--- Testing create_sequences ---")
+    test_data = np.arange(100).reshape(20, 5)  # 20 samples, 5 features
+    seq_len = 3
+    target_feature_idx = 0  # 最初の特徴量をターゲットとする
+    X, y = create_sequences(test_data, seq_len, target_feature_idx)
+    print("Shape of X:", X.shape)  # Expected: (17, 3, 5)
+    print("Shape of y:", y.shape)  # Expected: (17, 1)
+    print("First sequence (X[0]):\n", X[0])
+    print("First target (y[0]):", y[0])  # Expected: test_data[3, 0] = 15
+    print("Last sequence (X[-1]):\n", X[-1])
+    print("Last target (y[-1]):", y[-1])  # Expected: test_data[19, 0] = 95
+
+    # --- Testing save_data_to_csv and load_latest_data_from_csv ---
+    print("\n--- Testing CSV functions ---")
+    ticker = "9999.T"
+    save_data_to_csv(test_df, ticker)
+    loaded_df, _ = load_latest_data_from_csv(ticker)
+    if loaded_df is not None:
+        print("Loaded DataFrame successfully.")
+        # Check if dtypes are correct
+        print(loaded_df.dtypes)
+        assert loaded_df['record_date'].dtype == '<M8[ns]>'
+        print("record_date dtype is correct.")
+        # Clean up created dummy files and directory
+        files = glob.glob(f"data/*_{''.join(c for c in ticker if c.isalnum())}.csv")
+        for f in files:
+            os.remove(f)
+        if os.path.exists("data"):
+            os.rmdir("data")

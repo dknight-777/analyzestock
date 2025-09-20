@@ -19,6 +19,8 @@ from data_processing import (
     add_technical_features,
     add_date_features,
     add_dow_theory_features,
+    load_latest_data_from_csv,
+    save_data_to_csv,
 )
 from models import get_model
 from plotting import plot_prediction_chart
@@ -76,7 +78,7 @@ def main():
         "--nn_layer_units",
         type=int,
         nargs="+",
-        default=[1024, 512, 128, 64],
+        default=[8192, 4096, 2048],
         help="NNモデルの各隠れ層のユニット数をスペース区切りで指定 (例: 100 50)",
     )
     parser.add_argument(
@@ -105,132 +107,192 @@ def main():
     print(f"Using device: {device}")
 
     # yfinanceを使用して株価データを取得
-    try:
-        # 予測に必要な期間を自動的に決定
-        # モデルのシーケンス長、テストサイズ、テクニカル指標の最長期間を考慮
-        test_size = 30  # テストデータサイズ
-        min_data_points_for_features = (
-            26  # MACDのlong_periodなど、テクニカル指標に必要な最小データポイント数
-        )
+    df = None
+    now = datetime.now()
+    market_close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
 
-        # 処理後に必要な最小取引日数 = シーケンス長 + テストデータサイズ
-        min_trading_days_after_processing = args.seq_length + test_size
+    # 日本の証券コードに対応するため、末尾に ".T" を追加
+    if args.stock_code.isdigit() and len(args.stock_code) == 4:
+        ticker_code = f"{args.stock_code}.T"
+    else:
+        ticker_code = args.stock_code  # 米国株などの場合はそのまま
 
-        # dropna()で失われる可能性のある行数を考慮した、必要な最小取引日数
-        # (min_data_points_for_features - 1) は、テクニカル指標計算でNaNになる初期行数
-        min_raw_trading_days_needed = min_trading_days_after_processing + (
-            min_data_points_for_features - 1
-        )
+    # --- キャッシュの確認 ---
+    df_cache, cache_file_path = load_latest_data_from_csv(ticker_code)
+    download_required = True
 
-        # 基準となる期間数（例: 日次データ20年分に相当する期間数）
-        # 10年 * 250営業日/年 = 2500期間
-        base_num_periods = 10 * 250
-        if args.time_frame == "daily":
-            base_num_periods = 15 * 250
-        elif args.time_frame == "weekly":
-            base_num_periods = 10 * 250
-        elif args.time_frame == "monthly":
-            base_num_periods = 6 * 250
-
-        # time_frameに応じて必要なカレンダー日数を計算
-        if args.time_frame == "daily":
-            # 日次データの場合、base_num_periodsに安全マージンを追加
-            required_historical_days = (
-                int(base_num_periods * 1.4) + 60
-            )  # 1.4は営業日をカレンダー日に変換する係数
-        elif args.time_frame == "weekly":
-            # 週次データの場合、base_num_periods週分のカレンダー日数を取得
-            required_historical_days = (
-                int(base_num_periods * 7 * 1.2) + 60
-            )  # 1.2は週次データ取得時の安全マージン
-        elif args.time_frame == "monthly":
-            # 月次データの場合、base_num_periodsヶ月分のカレンダー日数を取得
-            required_historical_days = (
-                int(base_num_periods * 30 * 1.1) + 60
-            )  # 1.1は月次データ取得時の安全マージン
-        else:
-            # 未知のtime_frameの場合、デフォルトで20年分の日次データに相当する期間
-            required_historical_days = 20 * 365  # Fallback to 20 calendar years
-
-        # ただし、min_raw_trading_days_neededを満たす最低限の期間は保証する
-        # (これは主に、base_num_periodsが非常に小さい場合に備える)
-        min_required_by_logic = int(min_raw_trading_days_needed * 1.4) + 30
-        if required_historical_days < min_required_by_logic:
-            required_historical_days = min_required_by_logic
-
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=required_historical_days)
-
-        print(
-            f"Downloading stock data for {args.stock_code} from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')} (auto-determined based on model requirements)..."
-        )
-        # yfinanceを使用して株価データを取得
-        yf_interval_map = {
-            "daily": "1d",
-            "weekly": "1wk",
-            "monthly": "1mo",
-        }
-        yf_interval = yf_interval_map.get(
-            args.time_frame, "1d"
-        )  # Default to 1d if not found
-        if args.debug:
-            print(
-                f"DEBUG: yfinance interval set to: {yf_interval} for time_frame: {args.time_frame}"
+    if df_cache is not None and cache_file_path:
+        try:
+            # ファイル名から日付を取得
+            cache_filename = os.path.basename(cache_file_path)
+            # The datetime is in the format YYYYMMDD_HHMMSS
+            date_str = cache_filename.split("_")[0]
+            time_str = cache_filename.split("_")[1]
+            cache_datetime = datetime.strptime(
+                f"{date_str}_{time_str}", "%Y%m%d_%H%M%S"
             )
 
-        # 日本の証券コードに対応するため、末尾に ".T" を追加
-        # 証券コードが日本のものか判別し、必要に応じて ".T" を追加
-        # 日本の証券コードは通常4桁の数字
-        if args.stock_code.isdigit() and len(args.stock_code) == 4:
-            ticker_code = f"{args.stock_code}.T"
-        else:
-            ticker_code = args.stock_code  # 米国株などの場合はそのまま
-        df = yf.download(
-            ticker_code, start=start_date, end=end_date, interval=yf_interval
-        )
+            # --- 更新ロジック ---
+            # 1. キャッシュが今日より古い場合
+            if cache_datetime.date() < now.date():
+                print("Cached data is from a previous day. Downloading new data.")
+                download_required = True
+            # 2. キャッシュは今日だが、取引終了時刻後に実行され、かつキャッシュが取引終了時刻より古い場合
+            elif now > market_close_time and cache_datetime < market_close_time:
+                print(
+                    "Market has closed and cached data is from before the close. Downloading new data."
+                )
+                download_required = True
+            # 3. それ以外はキャッシュを使用
+            else:
+                print("Using cached data.")
+                df = df_cache
+                download_required = False
 
-        if df.empty:
+        except (ValueError, IndexError) as e:
             print(
-                f"銘柄コード {args.stock_code} のデータをyfinanceから取得できませんでした。"
+                f"Could not parse date from cache file name '{cache_file_path}'. Error: {e}. Will download new data."
+            )
+            download_required = True
+
+    if df is None:  # キャッシュがない場合はダウンロードが必要
+        download_required = True
+
+    if download_required:
+        print("Downloading new data...")
+        try:
+            # 予測に必要な期間を自動的に決定
+            # モデルのシーケンス長、テストサイズ、テクニカル指標の最長期間を考慮
+            test_size = 30  # テストデータサイズ
+            min_data_points_for_features = (
+                26  # MACDのlong_periodなど、テクニカル指標に必要な最小データポイント数
+            )
+
+            # 処理後に必要な最小取引日数 = シーケンス長 + テストデータサイズ
+            min_trading_days_after_processing = args.seq_length + test_size
+
+            # dropna()で失われる可能性のある行数を考慮した、必要な最小取引日数
+            # (min_data_points_for_features - 1) は、テクニカル指標計算でNaNになる初期行数
+            min_raw_trading_days_needed = min_trading_days_after_processing + (
+                min_data_points_for_features - 1
+            )
+
+            # 基準となる期間数（例: 日次データ20年分に相当する期間数）
+            # 10年 * 250営業日/年 = 2500期間
+            base_num_periods = 10 * 250
+            if args.time_frame == "daily":
+                base_num_periods = 15 * 250
+            elif args.time_frame == "weekly":
+                base_num_periods = 10 * 250
+            elif args.time_frame == "monthly":
+                base_num_periods = 6 * 250
+
+            # time_frameに応じて必要なカレンダー日数を計算
+            if args.time_frame == "daily":
+                # 日次データの場合、base_num_periodsに安全マージンを追加
+                required_historical_days = (
+                    int(base_num_periods * 1.4) + 60
+                )  # 1.4は営業日をカレンダー日に変換する係数
+            elif args.time_frame == "weekly":
+                # 週次データの場合、base_num_periods週分のカレンダー日数を取得
+                required_historical_days = (
+                    int(base_num_periods * 7 * 1.2) + 60
+                )  # 1.2は週次データ取得時の安全マージン
+            elif args.time_frame == "monthly":
+                # 月次データの場合、base_num_periodsヶ月分のカレンダー日数を取得
+                required_historical_days = (
+                    int(base_num_periods * 30 * 1.1) + 60
+                )  # 1.1は月次データ取得時の安全マージン
+            else:
+                # 未知のtime_frameの場合、デフォルトで20年分の日次データに相当する期間
+                required_historical_days = 20 * 365  # Fallback to 20 calendar years
+
+            # ただし、min_raw_trading_days_neededを満たす最低限の期間は保証する
+            # (これは主に、base_num_periodsが非常に小さい場合に備える)
+            min_required_by_logic = int(min_raw_trading_days_needed * 1.4) + 30
+            if required_historical_days < min_required_by_logic:
+                required_historical_days = min_required_by_logic
+
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=required_historical_days)
+
+            print(
+                f"Downloading stock data for {args.stock_code} from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}..."
+            )
+            # yfinanceを使用して株価データを取得
+            yf_interval_map = {
+                "daily": "1d",
+                "weekly": "1wk",
+                "monthly": "1mo",
+            }
+            yf_interval = yf_interval_map.get(
+                args.time_frame, "1d"
+            )  # Default to 1d if not found
+            if args.debug:
+                print(
+                    f"DEBUG: yfinance interval set to: {yf_interval} for time_frame: {args.time_frame}"
+                )
+
+            df_downloaded = yf.download(
+                ticker_code, start=start_date, end=end_date, interval=yf_interval
+            )
+
+            if df_downloaded.empty:
+                print(
+                    f"銘柄コード {args.stock_code} のデータをyfinanceから取得できませんでした。"
+                )
+                if df_cache is not None:
+                    print("Falling back to cached data.")
+                    df = df_cache
+                else:
+                    sys.exit(1)
+            else:
+                # yfinanceの列名を既存のコードに合わせる
+                df_downloaded.reset_index(inplace=True)  # 'Date'インデックスを列に変換
+
+                new_columns = []
+                for col in df_downloaded.columns:
+                    if isinstance(col, tuple):
+                        metric_name = col[0].lower()
+                        if metric_name == "date":
+                            new_columns.append("record_date")
+                        else:
+                            new_columns.append(metric_name)
+                    else:
+                        if str(col).lower() == "date":
+                            new_columns.append("record_date")
+                        else:
+                            new_columns.append(str(col).lower())
+                df_downloaded.columns = new_columns
+
+                # ダウンロードしたデータを保存
+                save_data_to_csv(df_downloaded, ticker_code)
+                df = df_downloaded
+
+        except ImportError:
+            print(
+                "yfinanceがインストールされていません。`pip install yfinance` を実行してください。"
             )
             sys.exit(1)
-
-        # yfinanceの列名を既存のコードに合わせる
-        df.reset_index(inplace=True)  # 'Date'インデックスを列に変換
-
-        # yfinanceが返すMultiIndexの列名をフラット化
-        # 例: ('Close', '7203.T') -> 'close'
-        # 例: ('Date', '') -> 'record_date'
-        new_columns = []
-        for col in df.columns:
-            if isinstance(col, tuple):
-                # タプルの場合、最初の要素（メトリック名）を小文字にする
-                metric_name = col[0].lower()
-                if metric_name == "date":
-                    new_columns.append("record_date")
-                else:
-                    new_columns.append(metric_name)
+        except Exception as e:
+            print(f"yfinanceでのデータ取得中にエラーが発生しました: {e}")
+            if df_cache is not None:
+                print("Falling back to cached data.")
+                df = df_cache
             else:
-                # タプルでない場合（通常はreset_index後の'Date'列）、小文字にして'record_date'にマッピング
-                if str(col).lower() == "date":
-                    new_columns.append("record_date")
-                else:
-                    new_columns.append(str(col).lower())
-        df.columns = new_columns
-        # print("DEBUG: df.columns after flattening:", df.columns)  # デバッグ出力は削除
+                sys.exit(1)
 
-        # 銘柄名を取得
-        ticker_info = yf.Ticker(ticker_code).info
-        stock_name = ticker_info.get("longName", args.stock_code)
-        print(f"Successfully downloaded data for: {stock_name}")
-
-    except ImportError:
-        print(
-            "yfinanceがインストールされていません。`pip install yfinance` を実行してください。"
-        )
-        sys.exit(1)
-    except Exception as e:
-        print(f"yfinanceでのデータ取得中にエラーが発生しました: {e}")
+    # 銘柄名を取得 (dfがNoneでないことを確認)
+    if df is not None:
+        try:
+            ticker_info = yf.Ticker(ticker_code).info
+            stock_name = ticker_info.get("longName", args.stock_code)
+            print(f"Successfully loaded data for: {stock_name}")
+        except Exception as e:
+            print(f"Could not retrieve stock name: {e}")
+            stock_name = args.stock_code
+    else:
+        print("最終的に利用可能なデータがありません。プログラムを終了します。")
         sys.exit(1)
 
     # --- 1. 特徴量エンジニアリング ---
