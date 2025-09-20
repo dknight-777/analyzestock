@@ -8,3 +8,4 @@ stock_prediction_charts/
 *.bak
 reports/
 venv/
+*.csv
