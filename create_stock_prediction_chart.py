@@ -21,6 +21,7 @@ from data_processing import (
     add_dow_theory_features,
     load_latest_data_from_csv,
     save_data_to_csv,
+    update_interest_rate_data,
 )
 from models import get_model
 from plotting import plot_prediction_chart
@@ -78,7 +79,7 @@ def main():
         "--nn_layer_units",
         type=int,
         nargs="+",
-        default=[8192, 4096, 2048],
+        default=[4096, 2048, 1024, 512],
         help="NNモデルの各隠れ層のユニット数をスペース区切りで指定 (例: 100 50)",
     )
     parser.add_argument(
@@ -92,6 +93,9 @@ def main():
         "--debug",
         action="store_true",
         help="デバッグ情報を表示します。",
+    )
+    parser.add_argument(
+        "--test_size", type=int, default=30, help="テストデータセットのサイズ"
     )
     args = parser.parse_args()
 
@@ -163,7 +167,7 @@ def main():
         try:
             # 予測に必要な期間を自動的に決定
             # モデルのシーケンス長、テストサイズ、テクニカル指標の最長期間を考慮
-            test_size = 30  # テストデータサイズ
+            test_size = args.test_size  # テストデータサイズ
             min_data_points_for_features = (
                 26  # MACDのlong_periodなど、テクニカル指標に必要な最小データポイント数
             )
@@ -226,8 +230,8 @@ def main():
                 "monthly": "1mo",
             }
             yf_interval = yf_interval_map.get(
-                args.time_frame, "1d"
-            )  # Default to 1d if not found
+                args.time_frame, "1d"  # Default to 1d if not found
+            )
             if args.debug:
                 print(
                     f"DEBUG: yfinance interval set to: {yf_interval} for time_frame: {args.time_frame}"
@@ -297,6 +301,34 @@ def main():
 
     # --- 1. 特徴量エンジニアリング ---
     df["record_date"] = pd.to_datetime(df["record_date"])
+
+    # --- 金利データを取得・マージ ---
+    # dfの日付範囲を取得
+    if not df.empty:
+        start_date_rates = df["record_date"].min() - timedelta(
+            days=7
+        )  # マージの余裕を持たせる
+        end_date_rates = df["record_date"].max() + timedelta(days=7)
+    else:  # dfが空の場合（初回ダウンロードなど）
+        end_date_rates = datetime.now()
+        start_date_rates = end_date_rates - timedelta(
+            days=15 * 365
+        )  # フォールバックとして15年分
+
+    interest_rates_data = update_interest_rate_data(start_date_rates, end_date_rates)
+    yield_columns = list(interest_rates_data.keys())
+
+    if interest_rates_data:
+        for name, rate_df in interest_rates_data.items():
+            rate_df = rate_df[["record_date", "close"]].rename(columns={"close": name})
+            df = pd.merge(df, rate_df, on="record_date", how="left")
+
+        # 金利データの欠損値を前方フィルで補完
+        df[yield_columns] = df[yield_columns].ffill()
+    else:
+        yield_columns = []
+        print("金利データを取得できなかったため、特徴量なしで処理を続行します。")
+
     df.set_index("record_date", inplace=True)
 
     time_frame_options = {
@@ -317,6 +349,10 @@ def main():
         "close": "last",
         "volume": "sum",
     }
+    # 金利カラムもリサンプリング対象に追加
+    for col in yield_columns:
+        ohlc_dict[col] = "last"  # 各期間の最後の金利を採用
+
     df = df.resample(resample_freq).agg(ohlc_dict)
     df.reset_index(inplace=True)
     df.dropna(subset=["open", "high", "low", "close", "volume"], inplace=True)
@@ -366,9 +402,9 @@ def main():
         "year",
         "log_return",
         "dow_trend",
-    ]
+    ] + yield_columns
 
-    test_size = 30  # test_sizeを再定義
+    test_size = args.test_size
     if len(df) <= test_size + args.seq_length:
         print("データが少なく、学習と評価を分割できません。")
         sys.exit(1)

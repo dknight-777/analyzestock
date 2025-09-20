@@ -107,25 +107,47 @@ def predict_future_values(
             else:
                 predicted_volume = current_df['volume'].iloc[-5] if len(current_df) >= 5 else current_df['volume'].iloc[0]
 
-        new_row = pd.DataFrame([{
+        # 新しい予測行の基本データを作成
+        new_row_data = {
             'record_date': date,
             'close': predicted_close,
             'volume': predicted_volume,
             'open': predicted_close + open_offset,
             'high': max(predicted_close, predicted_close + high_offset),
             'low': min(predicted_close, predicted_close + low_offset),
-        }])
-        
-        temp_df = pd.concat([current_df, new_row], ignore_index=True)
-        temp_df = add_date_features(temp_df)
-        temp_df = add_technical_features(temp_df)
-        temp_df = add_dow_theory_features(temp_df)
-        
-        new_sequence_row = temp_df[feature_columns].iloc[-1].values
+        }
+
+        # 金利データを追加 (最後の既知の値を使用)
+        for col in feature_columns:
+            if col not in new_row_data and col in historical_df.columns:
+                new_row_data[col] = historical_df[col].iloc[-1] # 最後の既知の金利を使用
+
+        # 新しい行をDataFrameとして作成
+        new_row_df = pd.DataFrame([new_row_data])
+        new_row_df['record_date'] = pd.to_datetime(new_row_df['record_date'])
+
+        # 過去データと新しい予測行を結合し、特徴量を再計算
+        # 必要な過去データのみを結合することで、計算コストとNaN発生を抑える
+        # テクニカル指標の計算に必要な最小期間を考慮
+        min_lookback_period = 26 # MACDのlong_periodなど、最も長い期間
+        temp_historical_df = current_df.iloc[-min_lookback_period:].copy()
+        combined_df = pd.concat([temp_historical_df, new_row_df], ignore_index=True)
+        combined_df.set_index('record_date', inplace=True)
+
+        # 特徴量を追加
+        combined_df = add_date_features(combined_df.reset_index())
+        combined_df = add_technical_features(combined_df)
+        combined_df = add_dow_theory_features(combined_df)
+        combined_df.set_index('record_date', inplace=True)
+
+        # 新しい予測行の全特徴量を取得
+        new_sequence_row = combined_df[feature_columns].iloc[-1].values
+
+        # last_sequenceを更新
         last_sequence = np.vstack([last_sequence[1:], new_sequence_row])
         
-        future_predictions.append(new_row.iloc[0])
-        current_df = temp_df
+        future_predictions.append(new_row_df.iloc[0])
+        current_df = pd.concat([current_df, new_row_df], ignore_index=True) # current_dfも更新して次の予測に備える
 
     predictions_df = pd.DataFrame(future_predictions)
     predicted_prices = predictions_df['close'].values

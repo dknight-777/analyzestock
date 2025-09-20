@@ -71,6 +71,103 @@ def calculate_bollinger_bands(series: pd.Series, period: int = 20, num_std_dev: 
     return upper_band, middle_band, lower_band
 
 
+def update_interest_rate_data(start_date: datetime, end_date: datetime) -> dict[str, pd.DataFrame]:
+    """
+    FREDから各種金利データをダウンロードし、更新・キャッシュ管理を行う。
+    """
+    try:
+        import pandas_datareader.data as web
+    except ImportError:
+        print("pandas-datareaderがインストールされていません。`pip install pandas-datareader` を実行してください。")
+        return {}
+
+    interest_rate_symbols = {
+        "jp_10y_yield": "IRLTLT01JPM156N",
+        "us_10y_yield": "DGS10",
+        "eu_10y_yield": "IRLTLT01EZM156N",
+    }
+    
+    all_rates_df = {}
+    now = datetime.now()
+
+    for name, symbol in interest_rate_symbols.items():
+        df_cache, cache_file_path = load_latest_data_from_csv(symbol)
+        download_required = True
+
+        if df_cache is not None and cache_file_path:
+            try:
+                cache_filename = os.path.basename(cache_file_path)
+                date_str = cache_filename.split('_')[0]
+                time_str = cache_filename.split('_')[1]
+                cache_datetime = datetime.strptime(f"{date_str}_{time_str}", "%Y%m%d_%H%M%S")
+
+                today = now.date()
+                cache_date = cache_datetime.date()
+
+                if symbol == "DGS10": # 米国10年債は日次データとして扱う
+                    if cache_date < today:
+                        print(f"Cached data for {name} is old. Downloading new data.")
+                        download_required = True
+                    else:
+                        print(f"Using cached data for {name} ({symbol}).")
+                        df_cache['record_date'] = pd.to_datetime(df_cache['record_date'])
+                        all_rates_df[name] = df_cache
+                        download_required = False
+                else: # 日本と欧州の10年債は月次データとして扱う
+                    # Condition 1: If it's the 16th of the month
+                    if today.day == 16:
+                        # Download if cache is older than the 16th of the current month
+                        if cache_date.month != today.month or cache_date.year != today.year or cache_date.day < 16:
+                            print(f"It's the 16th and cached data for {name} is old. Downloading new data.")
+                            download_required = True
+                        else:
+                            print(f"It's the 16th, but cached data for {name} is already up-to-date for this month. Using cached data.")
+                            df_cache['record_date'] = pd.to_datetime(df_cache['record_date'])
+                            all_rates_df[name] = df_cache
+                            download_required = False
+                    # Condition 2: If it's NOT the 16th of the month
+                    else:
+                        # Download if cache is not from today
+                        if cache_date < today:
+                            print(f"Cached data for {name} is old. Downloading new data.")
+                            download_required = True
+                        else:
+                            print(f"Using cached data for {name} ({symbol}).")
+                            df_cache['record_date'] = pd.to_datetime(df_cache['record_date'])
+                            all_rates_df[name] = df_cache
+                            download_required = False
+
+            except (ValueError, IndexError) as e:
+                print(f"Could not parse date from cache file name for {symbol}. Will download new data.")
+        
+        if download_required:
+            print(f"Downloading new data for {name} ({symbol})...")
+            try:
+                df_downloaded = web.DataReader(symbol, 'fred', start_date, end_date)
+                df_downloaded.reset_index(inplace=True)
+                df_downloaded.rename(columns={'DATE': 'record_date', symbol: 'close'}, inplace=True)
+                df_downloaded['record_date'] = pd.to_datetime(df_downloaded['record_date'])
+                
+                # 株価データに合わせてカラムを整形
+                df_downloaded['open'] = df_downloaded['close']
+                df_downloaded['high'] = df_downloaded['close']
+                df_downloaded['low'] = df_downloaded['close']
+                df_downloaded['volume'] = 0
+
+                save_data_to_csv(df_downloaded, symbol)
+                all_rates_df[name] = df_downloaded
+            except Exception as e:
+                print(f"Failed to download data for {symbol}: {e}")
+                if df_cache is not None:
+                    print(f"Falling back to cached data for {name} ({symbol}).")
+                    df_cache['record_date'] = pd.to_datetime(df_cache['record_date'])
+                    all_rates_df[name] = df_cache
+                else:
+                    continue # キャッシュもなければスキップ
+
+    return all_rates_df
+
+
 def add_dow_theory_features(df: pd.DataFrame, order: int = 5) -> pd.DataFrame:
     """ダウ理論に基づいたトレンド特徴量を追加します。"""
     
