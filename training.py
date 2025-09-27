@@ -117,10 +117,15 @@ def predict_future_values(
             'low': min(predicted_close, predicted_close + low_offset),
         }
 
-        # 金利データを追加 (最後の既知の値を使用)
+        # 金利や外部指標データを追加
         for col in feature_columns:
             if col not in new_row_data and col in historical_df.columns:
-                new_row_data[col] = historical_df[col].iloc[-1] # 最後の既知の金利を使用
+                # 外部指標の騰落率は将来の値を0と仮定
+                if '_log_return' in col and col != 'log_return': # 主銘柄のlog_returnは除く
+                    new_row_data[col] = 0.0
+                else:
+                    # それ以外の特徴量は最後の既知の値を使用
+                    new_row_data[col] = historical_df[col].iloc[-1]
 
         # 新しい行をDataFrameとして作成
         new_row_df = pd.DataFrame([new_row_data])

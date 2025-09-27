@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from typing import Tuple
+from typing import Tuple, List
 import os
 import glob
 from datetime import datetime
@@ -71,26 +71,48 @@ def calculate_bollinger_bands(series: pd.Series, period: int = 20, num_std_dev: 
     return upper_band, middle_band, lower_band
 
 
-def update_interest_rate_data(start_date: datetime, end_date: datetime) -> dict[str, pd.DataFrame]:
+def update_fred_data(
+    start_date: datetime, end_date: datetime, indices_to_fetch: List[str] | None = None
+) -> dict[str, pd.DataFrame]:
     """
-    FREDから各種金利データをダウンロードし、更新・キャッシュ管理を行う。
+    FREDから各種金利・株価指数データをダウンロードし、更新・キャッシュ管理を行う。
+    指定された指標のみをダウンロードする。
     """
+    if not indices_to_fetch:
+        return {}
+
     try:
         import pandas_datareader.data as web
     except ImportError:
-        print("pandas-datareaderがインストールされていません。`pip install pandas-datareader` を実行してください。")
+        print(
+            "pandas-datareaderがインストールされていません。`pip install pandas-datareader` を実行してください。"
+        )
         return {}
 
-    interest_rate_symbols = {
+    fred_symbols_master = {
         "jp_10y_yield": "IRLTLT01JPM156N",
         "us_10y_yield": "DGS10",
         "eu_10y_yield": "IRLTLT01EZM156N",
+        "dow_jones": "DJIA",
+        "sp500": "SP500",
+        "nikkei_225": "NIKKEI225",
     }
-    
-    all_rates_df = {}
+
+    # Fetch only the requested symbols
+    fred_symbols_to_fetch = {
+        name: symbol
+        for name, symbol in fred_symbols_master.items()
+        if name in indices_to_fetch
+    }
+
+    if not fred_symbols_to_fetch:
+        print("指定された外部指標が見つかりませんでした。")
+        return {}
+
+    all_data_df = {}
     now = datetime.now()
 
-    for name, symbol in interest_rate_symbols.items():
+    for name, symbol in fred_symbols_to_fetch.items():
         df_cache, cache_file_path = load_latest_data_from_csv(symbol)
         download_required = True
 
@@ -104,14 +126,17 @@ def update_interest_rate_data(start_date: datetime, end_date: datetime) -> dict[
                 today = now.date()
                 cache_date = cache_datetime.date()
 
-                if symbol == "DGS10": # 米国10年債は日次データとして扱う
+                # Daily data symbols
+                daily_symbols = ["DGS10", "DJIA", "SP500", "NIKKEI225"]
+
+                if symbol in daily_symbols:
                     if cache_date < today:
                         print(f"Cached data for {name} is old. Downloading new data.")
                         download_required = True
                     else:
                         print(f"Using cached data for {name} ({symbol}).")
                         df_cache['record_date'] = pd.to_datetime(df_cache['record_date'])
-                        all_rates_df[name] = df_cache
+                        all_data_df[name] = df_cache
                         download_required = False
                 else: # 日本と欧州の10年債は月次データとして扱う
                     # Condition 1: If it's the 16th of the month
@@ -123,7 +148,7 @@ def update_interest_rate_data(start_date: datetime, end_date: datetime) -> dict[
                         else:
                             print(f"It's the 16th, but cached data for {name} is already up-to-date for this month. Using cached data.")
                             df_cache['record_date'] = pd.to_datetime(df_cache['record_date'])
-                            all_rates_df[name] = df_cache
+                            all_data_df[name] = df_cache
                             download_required = False
                     # Condition 2: If it's NOT the 16th of the month
                     else:
@@ -134,7 +159,7 @@ def update_interest_rate_data(start_date: datetime, end_date: datetime) -> dict[
                         else:
                             print(f"Using cached data for {name} ({symbol}).")
                             df_cache['record_date'] = pd.to_datetime(df_cache['record_date'])
-                            all_rates_df[name] = df_cache
+                            all_data_df[name] = df_cache
                             download_required = False
 
             except (ValueError, IndexError) as e:
@@ -155,17 +180,17 @@ def update_interest_rate_data(start_date: datetime, end_date: datetime) -> dict[
                 df_downloaded['volume'] = 0
 
                 save_data_to_csv(df_downloaded, symbol)
-                all_rates_df[name] = df_downloaded
+                all_data_df[name] = df_downloaded
             except Exception as e:
                 print(f"Failed to download data for {symbol}: {e}")
                 if df_cache is not None:
                     print(f"Falling back to cached data for {name} ({symbol}).")
                     df_cache['record_date'] = pd.to_datetime(df_cache['record_date'])
-                    all_rates_df[name] = df_cache
+                    all_data_df[name] = df_cache
                 else:
                     continue # キャッシュもなければスキップ
 
-    return all_rates_df
+    return all_data_df
 
 
 def add_dow_theory_features(df: pd.DataFrame, order: int = 5) -> pd.DataFrame:
@@ -266,21 +291,22 @@ def add_date_features(df: pd.DataFrame) -> pd.DataFrame:
         df[f"{col}_cos"] = np.cos(2 * np.pi * df[col] / max_val)
     return df
 
-def save_data_to_csv(df: pd.DataFrame, ticker_code: str, data_dir: str = "data") -> str:
-    """DataFrameをタイムスタンプ付きのCSVファイルに保存します。"""
+def save_data_to_csv(df: pd.DataFrame, ticker_code: str, time_frame: str = None, data_dir: str = "data") -> str:
+    """DataFrameをタイムスタンプ付きのCSVファイルに保存します。時間枠(time_frame)が指定されていればファイル名に含めます。"""
     os.makedirs(data_dir, exist_ok=True)
     date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    # ticker_code may contain characters that are not suitable for file names, so we sanitize it.
     sanitized_ticker = "".join(c for c in ticker_code if c.isalnum())
-    file_path = os.path.join(data_dir, f"{date_str}_{sanitized_ticker}.csv")
+    time_frame_suffix = f"_{time_frame}" if time_frame else ""
+    file_path = os.path.join(data_dir, f"{date_str}_{sanitized_ticker}{time_frame_suffix}.csv")
     df.to_csv(file_path, index=False)
     print(f"Data saved to {file_path}")
     return file_path
 
-def load_latest_data_from_csv(ticker_code: str, data_dir: str = "data") -> Tuple[pd.DataFrame | None, str | None]:
-    """指定されたticker_codeの最新のCSVファイルを読み込み、DataFrameとファイルパスを返します。"""
+def load_latest_data_from_csv(ticker_code: str, time_frame: str = None, data_dir: str = "data") -> Tuple[pd.DataFrame | None, str | None]:
+    """指定されたticker_codeの最新のCSVファイルを読み込みます。時間枠(time_frame)が指定されていればその時間枠のファイルを検索します。"""
     sanitized_ticker = "".join(c for c in ticker_code if c.isalnum())
-    search_pattern = os.path.join(data_dir, f"*_{sanitized_ticker}.csv")
+    time_frame_suffix = f"_{time_frame}" if time_frame else ""
+    search_pattern = os.path.join(data_dir, f"*_{sanitized_ticker}{time_frame_suffix}.csv")
     file_list = glob.glob(search_pattern)
     if not file_list:
         return None, None

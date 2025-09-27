@@ -21,12 +21,13 @@ from data_processing import (
     add_dow_theory_features,
     load_latest_data_from_csv,
     save_data_to_csv,
-    update_interest_rate_data,
+    update_fred_data,
 )
 from models import get_model
 from plotting import plot_prediction_chart
 from training import train_model, predict_future_values
-from evaluation import evaluate_model
+from evaluation import evaluate_model, evaluate_gbm_garch
+from financial_models import predict_with_gbm_garch
 
 # --- Program Version ---
 __version__ = "0.9"
@@ -48,8 +49,8 @@ def main():
     parser.add_argument(
         "--model_type",
         type=str,
-        choices=["lstm", "nn", "gru"],
-        default="nn",
+        choices=["lstm", "nn", "gru", "gbm_garch"],
+        default="lstm",
         help="モデルの種類 (lstm, nn, gru)。",
     )
     parser.add_argument(
@@ -59,17 +60,17 @@ def main():
         default="daily",
         help="時間枠 (daily, weekly, monthly)",
     )
-    parser.add_argument("--epochs", type=int, default=150, help="学習のエポック数")
+    parser.add_argument("--epochs", type=int, default=300, help="学習のエポック数")
     parser.add_argument(
         "--log_interval", type=int, default=10, help="学習の進捗を表示する間隔"
     )
     parser.add_argument("--seq_length", type=int, default=30, help="シーケンス長")
     parser.add_argument("--fut_pred", type=int, default=5, help="予測期間（営業日数）")
-    parser.add_argument("--batch_size", type=int, default=32, help="バッチサイズ")
+    parser.add_argument("--batch_size", type=int, default=16, help="バッチサイズ")
     parser.add_argument(
         "--hidden_unit_size",
         type=int,
-        default=128,
+        default=512,
         help="隠れユニット数 (LSTM, GRU用)",
     )
     parser.add_argument(
@@ -79,8 +80,14 @@ def main():
         "--nn_layer_units",
         type=int,
         nargs="+",
-        default=[4096, 2048, 1024, 512],
+        default=[4096, 2048, 1024],
         help="NNモデルの各隠れ層のユニット数をスペース区切りで指定 (例: 100 50)",
+    )
+    parser.add_argument(
+        "--num_simulations",
+        type=int,
+        default=10000,
+        help="GBM+GARCHモデルのシミュレーション回数",
     )
     parser.add_argument(
         "--device",
@@ -96,6 +103,21 @@ def main():
     )
     parser.add_argument(
         "--test_size", type=int, default=30, help="テストデータセットのサイズ"
+    )
+    parser.add_argument(
+        "--external_indices",
+        type=str,
+        nargs="+",
+        choices=[
+            "jp_10y_yield",
+            "us_10y_yield",
+            "eu_10y_yield",
+            "dow_jones",
+            "sp500",
+            "nikkei_225",
+        ],
+        default=[],
+        help="特徴量として使用する外部指標をスペース区切りで指定します。",
     )
     args = parser.parse_args()
 
@@ -122,7 +144,9 @@ def main():
         ticker_code = args.stock_code  # 米国株などの場合はそのまま
 
     # --- キャッシュの確認 ---
-    df_cache, cache_file_path = load_latest_data_from_csv(ticker_code)
+    df_cache, cache_file_path = load_latest_data_from_csv(
+        ticker_code, time_frame=args.time_frame
+    )
     download_required = True
 
     if df_cache is not None and cache_file_path:
@@ -270,7 +294,7 @@ def main():
                 df_downloaded.columns = new_columns
 
                 # ダウンロードしたデータを保存
-                save_data_to_csv(df_downloaded, ticker_code)
+                save_data_to_csv(df_downloaded, ticker_code, time_frame=args.time_frame)
                 df = df_downloaded
 
         except ImportError:
@@ -302,32 +326,46 @@ def main():
     # --- 1. 特徴量エンジニアリング ---
     df["record_date"] = pd.to_datetime(df["record_date"])
 
-    # --- 金利データを取得・マージ ---
-    # dfの日付範囲を取得
-    if not df.empty:
-        start_date_rates = df["record_date"].min() - timedelta(
-            days=7
-        )  # マージの余裕を持たせる
-        end_date_rates = df["record_date"].max() + timedelta(days=7)
-    else:  # dfが空の場合（初回ダウンロードなど）
-        end_date_rates = datetime.now()
-        start_date_rates = end_date_rates - timedelta(
-            days=15 * 365
-        )  # フォールバックとして15年分
+    external_data_columns = []
+    external_data_log_return_columns = []
+    if args.external_indices:
+        # --- 外部データを取得・マージ ---
+        # dfの日付範囲を取得
+        if not df.empty:
+            start_date_ext = df["record_date"].min() - timedelta(
+                days=7
+            )  # マージの余裕を持たせる
+            end_date_ext = df["record_date"].max() + timedelta(days=7)
+        else:  # dfが空の場合（初回ダウンロードなど）
+            end_date_ext = datetime.now()
+            start_date_ext = end_date_ext - timedelta(
+                days=15 * 365
+            )  # フォールバックとして15年分
 
-    interest_rates_data = update_interest_rate_data(start_date_rates, end_date_rates)
-    yield_columns = list(interest_rates_data.keys())
+        external_data = update_fred_data(
+            start_date_ext, end_date_ext, indices_to_fetch=args.external_indices
+        )
+        if external_data:
+            external_data_columns = list(external_data.keys())
+            for name, rate_df in external_data.items():
+                rate_df = rate_df[["record_date", "close"]].rename(
+                    columns={"close": name}
+                )
+                df = pd.merge(df, rate_df, on="record_date", how="left")
 
-    if interest_rates_data:
-        for name, rate_df in interest_rates_data.items():
-            rate_df = rate_df[["record_date", "close"]].rename(columns={"close": name})
-            df = pd.merge(df, rate_df, on="record_date", how="left")
+            # 外部データの欠損値を前方フィルで補完
+            df[external_data_columns] = df[external_data_columns].ffill()
 
-        # 金利データの欠損値を前方フィルで補完
-        df[yield_columns] = df[yield_columns].ffill()
-    else:
-        yield_columns = []
-        print("金利データを取得できなかったため、特徴量なしで処理を続行します。")
+            # 外部データを騰落率（対数リターン）に変換
+            for col in external_data_columns:
+                log_return_col_name = f"{col}_log_return"
+                # 0や負の値を避けるために微小な値を加算
+                df[log_return_col_name] = np.log(
+                    df[col].replace(0, np.nan).ffill() + 1e-9
+                ) - np.log(df[col].replace(0, np.nan).ffill().shift(1) + 1e-9)
+                external_data_log_return_columns.append(log_return_col_name)
+        else:
+            print("外部データを取得できなかったため、特徴量なしで処理を続行します。")
 
     df.set_index("record_date", inplace=True)
 
@@ -336,24 +374,31 @@ def main():
         "weekly": {"freq": "W", "offset": pd.offsets.Week()},
         "monthly": {"freq": "ME", "offset": pd.offsets.MonthEnd()},
     }
-    resample_freq = time_frame_options[args.time_frame]["freq"]
-    if args.debug:
-        print(
-            f"DEBUG: Resampling frequency set to: {resample_freq} based on time_frame: {args.time_frame}"
-        )
 
-    ohlc_dict = {
-        "open": "first",
-        "high": "max",
-        "low": "min",
-        "close": "last",
-        "volume": "sum",
-    }
-    # 金利カラムもリサンプリング対象に追加
-    for col in yield_columns:
-        ohlc_dict[col] = "last"  # 各期間の最後の金利を採用
+    # yfinanceから直接weekly/monthlyデータを取得した場合はリサンプリング不要
+    # キャッシュ使用時(download_required=False)、またはdaily指定時(args.time_frame == 'daily')はリサンプリングを実行
+    if not download_required or args.time_frame == "daily":
+        resample_freq = time_frame_options[args.time_frame]["freq"]
+        if args.debug:
+            print(
+                f"DEBUG: Resampling frequency set to: {resample_freq} based on time_frame: {args.time_frame}"
+            )
 
-    df = df.resample(resample_freq).agg(ohlc_dict)
+        ohlc_dict = {
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum",
+        }
+        # 外部データカラムもリサンプリング対象に追加
+        for col in external_data_columns:
+            ohlc_dict[col] = "last"  # 各期間の最後の値を採用
+        for col in external_data_log_return_columns:
+            ohlc_dict[col] = "last"
+
+        df = df.resample(resample_freq).agg(ohlc_dict)
+
     df.reset_index(inplace=True)
     df.dropna(subset=["open", "high", "low", "close", "volume"], inplace=True)
     if args.debug:
@@ -402,7 +447,7 @@ def main():
         "year",
         "log_return",
         "dow_trend",
-    ] + yield_columns
+    ] + external_data_log_return_columns
 
     test_size = args.test_size
     if len(df) <= test_size + args.seq_length:
@@ -411,6 +456,11 @@ def main():
 
     train_df = df.iloc[:-test_size].copy()
     test_df = df.iloc[-test_size:].copy()
+
+    # DEBUG: Print statistics of features before scaling
+    print("\n--- Feature Statistics Before Scaling ---")
+    print(train_df[feature_columns].describe())
+    print("----------------------------------------\n")
 
     scaler = MinMaxScaler()
     scaler.fit(train_df[feature_columns])
@@ -433,109 +483,151 @@ def main():
     try:
         print(f"\n--- Running prediction for model: {model_type} ---")
 
-        # --- 3. シーケンス作成 ---
-        log_return_idx = feature_columns.index("log_return")
-
-        X_train, y_train = create_sequences(
-            train_scaled, args.seq_length, log_return_idx
-        )
-
-        padding_for_test = train_scaled[-args.seq_length :]
-        combined_for_test = np.concatenate([padding_for_test, test_scaled])
-        X_test, y_test = create_sequences(
-            combined_for_test, args.seq_length, log_return_idx
-        )
-
-        X_train_tensor = torch.from_numpy(X_train).float()
-        y_train_tensor = torch.from_numpy(y_train).float()
-        X_test_tensor = torch.from_numpy(X_test).float()
-        y_test_tensor = torch.from_numpy(y_test).float()
-
-        train_data = TensorDataset(X_train_tensor, y_train_tensor)
-        test_data = TensorDataset(X_test_tensor, y_test_tensor)
-
-        train_loader = DataLoader(
-            train_data,
-            shuffle=False,
-            batch_size=args.batch_size,
-            drop_last=False,
-        )
-        test_loader = DataLoader(test_data, shuffle=False, batch_size=args.batch_size)
-
-        # --- 4. モデルの取得と学習 ---
-        model = get_model(
-            model_type=model_type,
-            input_dim=len(feature_columns),
-            seq_length=args.seq_length,
-            output_dim=1,
-            hidden_unit_size=args.hidden_unit_size,
-            num_layers=args.num_layers,
-            nn_layer_units=args.nn_layer_units,
-        ).to(device)
-
-        model = train_model(
-            model,
-            train_loader,
-            args.epochs,
-            device,
-            log_interval=args.log_interval,
-        )
-
-        # --- 5. 評価と予測 ---
-        close_idx = feature_columns.index("close")
-        backtest_predictions, metrics = evaluate_model(
-            model,
-            test_loader,
-            scaler,
-            device,
-            len(feature_columns),
-            close_idx,
-            log_return_idx,
-            test_df,
-        )
-        metrics["model"] = model_type
-        evaluation_results.append(metrics)
-
-        if args.fut_pred > 0:
-            predictions, pred_volumes = predict_future_values(
-                model,
-                df.copy(),
-                future_dates,
-                scaler,
-                args.seq_length,
-                device,
-                feature_columns,
-                log_return_idx,
+        if model_type == "gbm_garch":
+            # --- 3. GARCH+GBMモデルの実行 ---
+            (
+                median_future_path,
+                backtest_predictions,
+                all_future_paths,
+            ) = predict_with_gbm_garch(
+                df,
+                fut_pred=args.fut_pred,
+                test_size=args.test_size,
+                num_simulations=args.num_simulations,
             )
-            predictions_list = predictions.flatten().tolist()
-            pred_volumes_list = pred_volumes.flatten().tolist()
+
+            # --- 5. 評価と予測 ---
+            metrics = evaluate_gbm_garch(backtest_predictions, test_df)
+            metrics["model"] = "gbm_garch"
+            evaluation_results.append(metrics)
+
+            predictions = median_future_path
 
             print(f"\n--- 予測詳細 (モデル: {model_type}) ---")
-            details_df = pd.DataFrame(
-                {
-                    "Date": future_dates,
-                    "Prediction": predictions_list,
-                    "Assumed Volume": pred_volumes_list,
-                }
-            )
+            details_df = pd.DataFrame({"Date": future_dates, "Prediction": predictions})
             print(details_df.to_string(index=False))
-        else:
-            predictions = np.array([])
-            pred_volumes = np.array([])
 
-        chart_binary = plot_prediction_chart(
-            df,
-            predictions,
-            future_dates,
-            args.stock_code,
-            stock_name,
-            model_type,
-            args.time_frame,
-            backtest_data={
-                "dates": test_df["record_date"].iloc[1 : len(backtest_predictions) + 1],
-                "predictions": backtest_predictions,
-            },
-        )
+            chart_binary = plot_prediction_chart(
+                df,
+                predictions,
+                future_dates,
+                args.stock_code,
+                stock_name,
+                model_type,
+                args.time_frame,
+                backtest_data={
+                    "dates": test_df["record_date"].iloc[: len(backtest_predictions)],
+                    "predictions": backtest_predictions,
+                },
+                simulation_paths=all_future_paths,
+            )
+
+        else:
+            # --- 3. シーケンス作成 ---
+            log_return_idx = feature_columns.index("log_return")
+
+            X_train, y_train = create_sequences(
+                train_scaled, args.seq_length, log_return_idx
+            )
+
+            padding_for_test = train_scaled[-args.seq_length :]
+            combined_for_test = np.concatenate([padding_for_test, test_scaled])
+            X_test, y_test = create_sequences(
+                combined_for_test, args.seq_length, log_return_idx
+            )
+
+            X_train_tensor = torch.from_numpy(X_train).float()
+            y_train_tensor = torch.from_numpy(y_train).float()
+            X_test_tensor = torch.from_numpy(X_test).float()
+            y_test_tensor = torch.from_numpy(y_test).float()
+
+            train_data = TensorDataset(X_train_tensor, y_train_tensor)
+            test_data = TensorDataset(X_test_tensor, y_test_tensor)
+
+            train_loader = DataLoader(
+                train_data,
+                shuffle=False,
+                batch_size=args.batch_size,
+                drop_last=False,
+            )
+            test_loader = DataLoader(
+                test_data, shuffle=False, batch_size=args.batch_size
+            )
+
+            # --- 4. モデルの取得と学習 ---
+            model = get_model(
+                model_type=model_type,
+                input_dim=len(feature_columns),
+                seq_length=args.seq_length,
+                output_dim=1,
+                hidden_unit_size=args.hidden_unit_size,
+                num_layers=args.num_layers,
+                nn_layer_units=args.nn_layer_units,
+            ).to(device)
+
+            model = train_model(
+                model,
+                train_loader,
+                args.epochs,
+                device,
+                log_interval=args.log_interval,
+            )
+
+            # --- 5. 評価と予測 ---
+            close_idx = feature_columns.index("close")
+            backtest_predictions, metrics = evaluate_model(
+                model,
+                test_loader,
+                scaler,
+                device,
+                len(feature_columns),
+                close_idx,
+                log_return_idx,
+                test_df,
+            )
+            metrics["model"] = model_type
+            evaluation_results.append(metrics)
+
+            if args.fut_pred > 0:
+                predictions, pred_volumes = predict_future_values(
+                    model,
+                    df.copy(),
+                    future_dates,
+                    scaler,
+                    args.seq_length,
+                    device,
+                    feature_columns,
+                    log_return_idx,
+                )
+                predictions_list = predictions.flatten().tolist()
+                pred_volumes_list = pred_volumes.flatten().tolist()
+
+                print(f"\n--- 予測詳細 (モデル: {model_type}) ---")
+                details_df = pd.DataFrame(
+                    {
+                        "Date": future_dates,
+                        "Prediction": predictions_list,
+                        "Assumed Volume": pred_volumes_list,
+                    }
+                )
+                print(details_df.to_string(index=False))
+            else:
+                predictions = np.array([])
+                pred_volumes = np.array([])
+
+            chart_binary = plot_prediction_chart(
+                df,
+                predictions,
+                future_dates,
+                args.stock_code,
+                stock_name,
+                model_type,
+                args.time_frame,
+                backtest_data={
+                    "dates": test_df["record_date"].iloc[: len(backtest_predictions)],
+                    "predictions": backtest_predictions,
+                },
+            )
         print(f"グラフをメモリ上に生成しました。")
 
         # グラフをファイルに保存する

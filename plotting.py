@@ -17,6 +17,7 @@ def plot_prediction_chart(
     model_type: str,
     time_frame: str,
     backtest_data: dict | None = None,
+    simulation_paths: np.ndarray | None = None, # 引数は残すが、使用しない
 ) -> bytes:
     """結果をプロットし、チャート画像のバイナリデータを返します。"""
     try:
@@ -46,52 +47,40 @@ def plot_prediction_chart(
     # Plot actual stock price using numerical index
     plt.plot(range(len(plot_df)), plot_df["close"], label="実際の株価", color="blue")
 
-    # Plot Bollinger Bands if they exist
+    # Plot historical Bollinger Bands
     if all(col in plot_df.columns for col in ['bb_upper', 'bb_middle', 'bb_lower']):
-        # Plot the middle band
         plt.plot(range(len(plot_df)), plot_df['bb_middle'], linestyle='--', color='gray', alpha=0.7, label='ボリンジャーバンド (中央)')
-        # Shade the area between the upper and lower bands
         plt.fill_between(range(len(plot_df)), plot_df['bb_lower'], plot_df['bb_upper'], color='gray', alpha=0.2, label='ボリンジャーバンド (±2σ)')
 
-    # Plot future predictions using numerical index, offset by length of actual data
-    # Prepend the last actual close value to predictions to create a continuous line
-    # The x-coordinate for this point will be len(plot_df) - 1
-    extended_predictions = np.insert(predictions, 0, plot_df["close"].iloc[-1])
-
-    # The x-range for the extended predictions starts from the last actual data point's index
+    # Plot future prediction line
     start_index_extended_predictions = len(plot_df) - 1
+    extended_predictions = np.insert(predictions, 0, plot_df["close"].iloc[-1])
+    x_range_future = range(start_index_extended_predictions, start_index_extended_predictions + len(extended_predictions))
     
-    plt.plot(range(start_index_extended_predictions, start_index_extended_predictions + len(extended_predictions)),
+    plt.plot(x_range_future,
              extended_predictions,
              label=f"将来の予測 ({model_type.upper()})",
-             linestyle="--", # Keep the same linestyle as future predictions
+             linestyle="--",
              color="orange")
 
-    # 予測接続線は将来予測に含められたため削除
-
     # Set x-axis ticks and labels to show actual dates
-    tick_indices = np.linspace(0, len(all_dates) - 1, 10, dtype=int)
-    tick_labels = [all_dates.iloc[i].strftime("%Y-%m-%d") for i in tick_indices]
-    plt.xticks(tick_indices, tick_labels, rotation=45, ha="right", color="black")
+    tick_indices = np.arange(len(all_dates))
+    tick_labels = [d.strftime("%Y-%m-%d") for d in all_dates]
+    plt.xticks(tick_indices, tick_labels, rotation=90, ha="center", color="black", fontsize=8)
     plt.yticks(color="black")
 
     # 最高値・最安値の注釈
-    # Create a list of DataFrames, each with 'numerical_index', 'record_date', 'close'
     annotation_dfs = []
-
-    # Actual data
     actual_annotation_df = plot_df[["record_date", "close"]].copy()
     actual_annotation_df["numerical_index"] = range(len(plot_df))
     annotation_dfs.append((actual_annotation_df, "black"))
 
-    # Predicted data
     if predictions.size > 0:
         predicted_annotation_df = pd.DataFrame({
             "record_date": future_dates,
             "close": predictions.flatten()
         })
         predicted_annotation_df["numerical_index"] = range(len(plot_df), len(plot_df) + len(predictions))
-        # Ensure 'close' column contains scalar Python floats
         predicted_annotation_df["close"] = predicted_annotation_df["close"].astype(float)
         annotation_dfs.append((predicted_annotation_df, "black"))
 
@@ -99,13 +88,13 @@ def plot_prediction_chart(
         if not data_frame.empty:
             for index, row in data_frame.iterrows():
                 plt.text(
-                    row["numerical_index"], # Use numerical index for x-coordinate
+                    row["numerical_index"],
                     row["close"],
                     f" {row['close']:.2f}",
-                    va="center", # Center vertically
-                    ha="center", # Center horizontally
+                    va="center",
+                    ha="center",
                     color=color,
-                    fontsize=7, # Smaller font size to reduce clutter
+                    fontsize=7,
                 )
 
     time_frame_japanese = "日足" if time_frame == "daily" else "週足"
@@ -121,11 +110,9 @@ def plot_prediction_chart(
         text.set_color("black")
     plt.grid(True, linestyle="--", alpha=0.6)
     plt.tight_layout()
-    # 旧X軸フォーマット設定 (ユーザーの要望により削除)
 
-    # ファイルに保存する代わりに、バイナリデータを返す
     buf = io.BytesIO()
     plt.savefig(buf, format="png", dpi=150)
-    plt.close()  # メモリリークを防ぐために図を閉じる
+    plt.close()
     buf.seek(0)
     return buf.getvalue()

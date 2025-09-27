@@ -5,6 +5,9 @@ argparse==1.4.0
 matplotlib
 scikit-learn
 pandas-datareader
+grep
+arch
+tqdm
 --extra-index-url https://download.pytorch.org/whl/cu121
 torch==2.5.1
 torchvision==0.20.1

@@ -37,17 +37,19 @@ def evaluate_model(
     unscaled_log_returns = scaler.inverse_transform(dummy_array)[:, log_return_idx]
 
     # 対数リターンを価格に変換
-    # 評価期間の最初の価格を取得
-    last_known_price = test_df['close'].iloc[0]
+    # 各予測は、その前日の実際の終値に基づいて計算されるべき
+    # これにより、予測誤差の累積を防ぐ
     
-    predicted_prices = []
-    for log_return in unscaled_log_returns:
-        next_price = last_known_price * np.exp(log_return)
-        predicted_prices.append(next_price)
-        # 次の反復のために、価格を更新（実績値ではなく予測値を使う）
-        last_known_price = next_price
+    # 前日の終値のリストを取得 (テストセットの最初から最後から2番目まで)
+    previous_actual_prices = test_df['close'].iloc[:-1].values
 
-    predicted_prices = np.array(predicted_prices)
+    # 予測と実績の長さを合わせる
+    min_len = min(len(unscaled_log_returns), len(previous_actual_prices))
+    unscaled_log_returns = unscaled_log_returns[:min_len]
+    previous_actual_prices = previous_actual_prices[:min_len]
+
+    # 予測価格を計算
+    predicted_prices = previous_actual_prices * np.exp(unscaled_log_returns)
     
     # 実績値（評価期間の2日目から）
     actual_prices = test_df['close'].iloc[1:len(predicted_prices) + 1].values
@@ -71,3 +73,28 @@ def evaluate_model(
 
     # グラフ描画用に、バックテスト期間の予測価格を返す
     return predicted_prices, metrics
+
+def evaluate_gbm_garch(backtest_predictions: np.ndarray, test_df: pd.DataFrame) -> dict[str, float]:
+    """
+    GBM+GARCHモデルのバックテスト結果を評価します。
+    """
+    actual_prices = test_df['close'].values
+    
+    # 予測と実績の長さを合わせる
+    min_len = min(len(backtest_predictions), len(actual_prices))
+    backtest_predictions = backtest_predictions[:min_len]
+    actual_prices = actual_prices[:min_len]
+
+    # 評価指標を計算
+    rmse = np.sqrt(mean_squared_error(actual_prices, backtest_predictions))
+    mae = mean_absolute_error(actual_prices, backtest_predictions)
+    r2 = r2_score(actual_prices, backtest_predictions)
+
+    metrics = {"RMSE": rmse, "MAE": mae, "R2 Score": r2}
+
+    print("\n--- バックテスト評価 (GBM-GARCH) ---")
+    for key, value in metrics.items():
+        print(f"{key}: {value:.4f}")
+    print("------------------------------------\n")
+
+    return metrics
