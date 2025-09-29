@@ -60,7 +60,7 @@ def main():
         default="daily",
         help="時間枠 (daily, weekly, monthly)",
     )
-    parser.add_argument("--epochs", type=int, default=300, help="学習のエポック数")
+    parser.add_argument("--epochs", type=int, default=150, help="学習のエポック数")
     parser.add_argument(
         "--log_interval", type=int, default=10, help="学習の進捗を表示する間隔"
     )
